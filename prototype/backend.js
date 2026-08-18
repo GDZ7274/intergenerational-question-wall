@@ -4,6 +4,16 @@
   const supabaseAnonKey = String(config.supabaseAnonKey || "");
   const enabled = Boolean(supabaseUrl && supabaseAnonKey);
 
+  class BackendError extends Error {
+    constructor(message, options = {}) {
+      super(message);
+      this.name = "BackendError";
+      this.code = options.code || "remote_error";
+      this.status = options.status || 0;
+      this.retryAfter = Number(options.retryAfter || 0);
+    }
+  }
+
   function requestHeaders(prefer = "") {
     const headers = {
       apikey: supabaseAnonKey,
@@ -25,11 +35,37 @@
 
     if (!response.ok) {
       const detail = await response.text();
-      throw new Error(`Remote request failed (${response.status}): ${detail.slice(0, 240)}`);
+      let payload = null;
+      try {
+        payload = detail ? JSON.parse(detail) : null;
+      } catch {
+        // PostgREST can return plain text for proxy-level failures.
+      }
+      throw new BackendError(
+        payload?.message || `Remote request failed (${response.status}).`,
+        {
+          code: payload?.code || "remote_error",
+          status: response.status,
+        },
+      );
     }
     if (response.status === 204) return null;
     const responseBody = await response.text();
     return responseBody ? JSON.parse(responseBody) : null;
+  }
+
+  async function rpc(name, parameters = {}) {
+    const payload = await request(`rpc/${name}`, {
+      method: "POST",
+      body: parameters,
+    });
+    if (payload?.ok === false) {
+      throw new BackendError(payload.message || "请求暂时无法完成。", {
+        code: payload.error,
+        retryAfter: payload.retryAfter,
+      });
+    }
+    return payload;
   }
 
   function mapNote(row) {
@@ -71,62 +107,80 @@
     };
   }
 
-  async function createQuestion({ id, authorSessionId, authorRole, body, anonymous }) {
-    await request("questions", {
-      method: "POST",
-      prefer: "return=minimal",
-      body: {
-        id,
-        author_session_id: authorSessionId,
-        author_role: authorRole,
-        body,
-        anonymous,
-      },
+  async function loadRuntimeStatus() {
+    const status = await rpc("public_runtime_status");
+    return {
+      schemaVersion: Number(status?.schemaVersion || 0),
+      submissionsPaused: Boolean(status?.submissionsPaused),
+      readOnly: Boolean(status?.readOnly),
+      emergencyLockdown: Boolean(status?.emergencyLockdown),
+      publicMessage: typeof status?.publicMessage === "string" ? status.publicMessage : "",
+    };
+  }
+
+  async function createQuestion({ authorSessionId, authorRole, body, anonymous }) {
+    const result = await rpc("submit_question", {
+      p_session_id: authorSessionId,
+      p_author_role: authorRole,
+      p_body: body,
+      p_anonymous: anonymous,
     });
     return {
-      id,
+      id: result.id,
       direction: authorRole === "adult" ? "adult_to_child" : "child_to_adult",
       askerRole: authorRole,
       targetRole: authorRole === "adult" ? "child" : "adult",
       body,
       answerCount: 0,
-      createdAt: new Date().toISOString(),
-      status: "pending",
+      createdAt: result.createdAt || new Date().toISOString(),
+      status: result.status || "pending",
       authorSessionId,
+      receipt: result.receipt,
     };
   }
 
-  async function createAnswer({ id, questionId, authorSessionId, authorRole, body, anonymous }) {
-    await request("answers", {
-      method: "POST",
-      prefer: "return=minimal",
-      body: {
-        id,
-        question_id: questionId,
-        author_session_id: authorSessionId,
-        author_role: authorRole,
-        body,
-        anonymous,
-      },
+  async function createAnswer({ questionId, authorSessionId, authorRole, body, anonymous }) {
+    const result = await rpc("submit_answer", {
+      p_session_id: authorSessionId,
+      p_question_id: questionId,
+      p_author_role: authorRole,
+      p_body: body,
+      p_anonymous: anonymous,
     });
     return {
-      id,
+      id: result.id,
       questionId,
-      status: "pending",
-      createdAt: new Date().toISOString(),
+      status: result.status || "pending",
+      createdAt: result.createdAt || new Date().toISOString(),
+      receipt: result.receipt,
     };
   }
 
-  async function createReport({ noteId, reporterSessionId }) {
-    await request("reports", {
-      method: "POST",
-      prefer: "return=minimal",
-      body: {
-        target_type: "note",
-        target_id: noteId,
-        reporter_session_id: reporterSessionId,
-        reason: "other",
-      },
+  async function createReport({ noteId, reporterSessionId, reason = "other" }) {
+    return rpc("submit_report", {
+      p_session_id: reporterSessionId,
+      p_note_id: noteId,
+      p_reason: reason,
+    });
+  }
+
+  async function getSubmissionStatus(receipt) {
+    return rpc("get_submission_status", { p_receipt: receipt });
+  }
+
+  async function resubmitQuestion({ receipt, body, anonymous }) {
+    return rpc("resubmit_question", {
+      p_receipt: receipt,
+      p_body: body,
+      p_anonymous: anonymous,
+    });
+  }
+
+  async function resubmitAnswer({ receipt, body, anonymous }) {
+    return rpc("resubmit_answer", {
+      p_receipt: receipt,
+      p_body: body,
+      p_anonymous: anonymous,
     });
   }
 
@@ -134,8 +188,12 @@
     enabled,
     experienceMode: false,
     loadContent,
+    loadRuntimeStatus,
     createQuestion,
     createAnswer,
     createReport,
+    getSubmissionStatus,
+    resubmitQuestion,
+    resubmitAnswer,
   });
 })();

@@ -6,14 +6,14 @@
     <meta name="robots" content="noindex, nofollow" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https://*.supabase.co; base-uri 'self'; form-action 'self'"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https://*.supabase.co; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <meta name="description" content="问问墙内容审核与运营管理后台。" />
     <title>内容审核 · 问问墙</title>
     <link rel="preload" href="assets/note-wall-background.jpg" as="image" />
-    <link rel="stylesheet" href="admin.css?v=2" />
-    <script defer src="config.js?v=2"></script>
-    <script defer src="admin.js?v=2"></script>
+    <link rel="stylesheet" href="admin.css?v=5" />
+    <script defer src="config.js?v=3"></script>
+    <script defer src="admin.js?v=6"></script>
   </head>
   <body>
     <a class="skip-link" href="#admin-main">跳到主要内容</a>
@@ -57,7 +57,9 @@
             <span class="environment-badge">审核后台</span>
           </div>
           <div class="admin-header-actions">
+            <span id="runtime-indicator" class="runtime-indicator" data-state="unknown">状态读取中</span>
             <span id="admin-identity" class="admin-identity"></span>
+            <span id="admin-role" class="admin-role"></span>
             <button id="refresh-button" class="icon-command" type="button" title="刷新审核数据" aria-label="刷新审核数据">刷新</button>
             <button id="logout-button" class="icon-command" type="button">退出</button>
           </div>
@@ -89,6 +91,15 @@
             </dl>
           </section>
 
+          <section id="runtime-banner" class="runtime-banner" data-state="unknown" aria-live="polite">
+            <span class="runtime-dot" aria-hidden="true"></span>
+            <div class="runtime-banner-copy">
+              <strong id="runtime-banner-title">正在读取站点状态</strong>
+              <span id="runtime-banner-message">请稍候。</span>
+            </div>
+            <button id="runtime-open-button" class="runtime-manage-button" type="button" hidden>管理开关</button>
+          </section>
+
           <nav class="queue-tabs" aria-label="管理视图">
             <button class="queue-tab" type="button" data-view="questions" aria-current="page">
               待审问题 <span id="tab-count-questions">0</span>
@@ -101,6 +112,7 @@
             </button>
             <button class="queue-tab" type="button" data-view="content">内容管理</button>
             <button class="queue-tab" type="button" data-view="history">操作记录</button>
+            <button id="runtime-tab" class="queue-tab" type="button" data-view="runtime" hidden>运营开关</button>
           </nav>
 
           <section class="workspace" aria-labelledby="workspace-title">
@@ -123,17 +135,57 @@
                 </label>
                 <label id="content-status-field" class="select-field" for="content-status" hidden>
                   <span>状态</span>
-                  <select id="content-status">
-                    <option value="">全部状态</option>
-                    <option value="pending">待审核</option>
-                    <option value="open">开放</option>
-                    <option value="closed">已关闭</option>
-                    <option value="hidden">已隐藏</option>
-                    <option value="rejected">已驳回</option>
-                  </select>
+                  <select id="content-status"></select>
                 </label>
               </div>
             </div>
+
+            <section id="runtime-panel" class="runtime-panel" aria-labelledby="runtime-panel-title" hidden>
+              <div class="runtime-panel-heading">
+                <div>
+                  <p class="workspace-eyebrow">仅所有者可修改</p>
+                  <h3 id="runtime-panel-title">站点运行控制</h3>
+                </div>
+                <p id="runtime-updated-at" class="runtime-updated-at"></p>
+              </div>
+
+              <form id="runtime-form" class="runtime-form">
+                <div class="runtime-control-list">
+                  <label class="runtime-control" for="runtime-submissions-paused">
+                    <span>
+                      <strong>暂停投稿</strong>
+                      <small>停止新问题和回答，浏览与举报保持可用。</small>
+                    </span>
+                    <input id="runtime-submissions-paused" name="submissionsPaused" type="checkbox" />
+                  </label>
+                  <label class="runtime-control" for="runtime-read-only">
+                    <span>
+                      <strong>全站只读</strong>
+                      <small>保留公开浏览，暂停投稿和其他访客写入。</small>
+                    </span>
+                    <input id="runtime-read-only" name="readOnly" type="checkbox" />
+                  </label>
+                  <label class="runtime-control runtime-control-danger" for="runtime-emergency-lockdown">
+                    <span>
+                      <strong>维护 / 应急隐藏</strong>
+                      <small>立即隐藏公开内容并停止参与，仅用于安全事件或紧急维护。</small>
+                    </span>
+                    <input id="runtime-emergency-lockdown" name="emergencyLockdown" type="checkbox" />
+                  </label>
+                </div>
+
+                <label class="runtime-message-field" for="runtime-public-message">
+                  <span>前台提示</span>
+                  <textarea id="runtime-public-message" name="publicMessage" maxlength="160" rows="3" placeholder="例如：系统维护中，请稍后再来"></textarea>
+                  <small><span id="runtime-message-count">0</span> / 160</small>
+                </label>
+
+                <div class="runtime-form-actions">
+                  <p id="runtime-form-status" class="runtime-form-status" role="status" aria-live="polite"></p>
+                  <button id="runtime-save-button" class="button button-primary" type="submit">保存运行设置</button>
+                </div>
+              </form>
+            </section>
 
             <div id="workspace-loading" class="workspace-state" role="status">正在读取审核数据…</div>
             <div id="workspace-empty" class="workspace-state" hidden>
@@ -149,16 +201,39 @@
     </main>
 
     <dialog id="reason-dialog" class="reason-dialog" aria-labelledby="reason-title">
-      <form id="reason-form" method="dialog">
+      <form id="reason-form" method="dialog" novalidate>
         <div class="dialog-heading">
           <p id="reason-eyebrow">审核操作</p>
           <h2 id="reason-title">填写处理说明</h2>
         </div>
-        <label for="reason-input">说明</label>
-        <textarea id="reason-input" name="reason" maxlength="500" rows="4" placeholder="可选，填写后会记录在操作日志中"></textarea>
+        <label id="reason-label" for="reason-input">处理说明</label>
+        <textarea id="reason-input" name="reason" maxlength="500" rows="4" aria-describedby="reason-hint reason-error"></textarea>
+        <div class="reason-assist">
+          <p id="reason-hint">说明会写入操作日志。</p>
+          <span><span id="reason-count">0</span> / 500</span>
+        </div>
+        <p id="reason-error" class="dialog-error" role="alert"></p>
         <div class="dialog-actions">
           <button class="button button-secondary" type="button" data-dialog-cancel>取消</button>
           <button id="reason-confirm" class="button button-primary" type="submit">确认处理</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="emergency-dialog" class="reason-dialog emergency-dialog" aria-labelledby="emergency-title">
+      <form id="emergency-form">
+        <div class="dialog-heading">
+          <p>高风险操作</p>
+          <h2 id="emergency-title">确认应急隐藏全站内容</h2>
+        </div>
+        <p class="emergency-copy">启用后，公开便签和问题池会立即对访客隐藏，所有参与入口同时关闭。管理员后台仍可使用。</p>
+        <label class="emergency-ack" for="emergency-ack">
+          <input id="emergency-ack" type="checkbox" required />
+          <span>我已确认影响范围，并准备好恢复方案。</span>
+        </label>
+        <div class="dialog-actions">
+          <button class="button button-secondary" type="button" data-emergency-cancel>取消</button>
+          <button id="emergency-confirm" class="button button-danger" type="submit">确认应急隐藏</button>
         </div>
       </form>
     </dialog>

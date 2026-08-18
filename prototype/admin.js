@@ -19,6 +19,13 @@
     loginStatus: document.getElementById("login-status"),
     dashboardView: document.getElementById("dashboard-view"),
     adminIdentity: document.getElementById("admin-identity"),
+    adminRole: document.getElementById("admin-role"),
+    runtimeIndicator: document.getElementById("runtime-indicator"),
+    runtimeBanner: document.getElementById("runtime-banner"),
+    runtimeBannerTitle: document.getElementById("runtime-banner-title"),
+    runtimeBannerMessage: document.getElementById("runtime-banner-message"),
+    runtimeOpenButton: document.getElementById("runtime-open-button"),
+    runtimeTab: document.getElementById("runtime-tab"),
     refreshButton: document.getElementById("refresh-button"),
     logoutButton: document.getElementById("logout-button"),
     summaryQuestions: document.getElementById("summary-questions"),
@@ -29,6 +36,7 @@
     tabCountAnswers: document.getElementById("tab-count-answers"),
     tabCountReports: document.getElementById("tab-count-reports"),
     tabs: [...document.querySelectorAll(".queue-tab")],
+    workspace: document.querySelector(".workspace"),
     workspaceEyebrow: document.getElementById("workspace-eyebrow"),
     workspaceTitle: document.getElementById("workspace-title"),
     contentSearch: document.getElementById("content-search"),
@@ -41,12 +49,29 @@
     workspaceError: document.getElementById("workspace-error"),
     contentList: document.getElementById("content-list"),
     loadMoreButton: document.getElementById("load-more-button"),
+    runtimePanel: document.getElementById("runtime-panel"),
+    runtimeForm: document.getElementById("runtime-form"),
+    runtimeSubmissionsPaused: document.getElementById("runtime-submissions-paused"),
+    runtimeReadOnly: document.getElementById("runtime-read-only"),
+    runtimeEmergencyLockdown: document.getElementById("runtime-emergency-lockdown"),
+    runtimePublicMessage: document.getElementById("runtime-public-message"),
+    runtimeMessageCount: document.getElementById("runtime-message-count"),
+    runtimeUpdatedAt: document.getElementById("runtime-updated-at"),
+    runtimeFormStatus: document.getElementById("runtime-form-status"),
+    runtimeSaveButton: document.getElementById("runtime-save-button"),
     reasonDialog: document.getElementById("reason-dialog"),
     reasonForm: document.getElementById("reason-form"),
     reasonEyebrow: document.getElementById("reason-eyebrow"),
     reasonTitle: document.getElementById("reason-title"),
+    reasonLabel: document.getElementById("reason-label"),
     reasonInput: document.getElementById("reason-input"),
+    reasonHint: document.getElementById("reason-hint"),
+    reasonCount: document.getElementById("reason-count"),
+    reasonError: document.getElementById("reason-error"),
     reasonConfirm: document.getElementById("reason-confirm"),
+    emergencyDialog: document.getElementById("emergency-dialog"),
+    emergencyForm: document.getElementById("emergency-form"),
+    emergencyAck: document.getElementById("emergency-ack"),
     toast: document.getElementById("admin-toast"),
   };
 
@@ -54,6 +79,7 @@
     session: null,
     profile: null,
     summary: {},
+    runtimeSettings: null,
     view: "questions",
     rows: [],
     hasMore: false,
@@ -61,9 +87,12 @@
     contentType: "questions",
     contentStatus: "",
     pendingAction: null,
-    loading: false,
-    refreshPromise: null,
-    refreshQueued: false,
+    pendingRuntimeSettings: null,
+    sessionRefreshPromise: null,
+    workspaceRefreshPromise: null,
+    workspaceRefreshQueued: false,
+    loadMorePromise: null,
+    settingsSavePromise: null,
     workspaceRequestId: 0,
     searchTimer: null,
     toastTimer: null,
@@ -75,6 +104,7 @@
     reports: ["风险处置", "未处理举报"],
     content: ["内容运营", "内容管理"],
     history: ["权限审计", "操作记录"],
+    runtime: ["站点安全", "运营开关"],
   };
 
   const contentStatusOptions = {
@@ -127,6 +157,9 @@
   function clearSession() {
     state.session = null;
     state.profile = null;
+    state.runtimeSettings = null;
+    state.workspaceRequestId += 1;
+    state.workspaceRefreshQueued = false;
     sessionStorage.removeItem(sessionKey);
   }
 
@@ -155,9 +188,9 @@
   async function refreshSession(force = false) {
     if (!state.session) throw new Error("登录会话已失效，请重新登录。");
     if (!force && state.session.expiresAt > Date.now() + 60_000) return state.session;
-    if (state.refreshPromise) return state.refreshPromise;
+    if (state.sessionRefreshPromise) return state.sessionRefreshPromise;
 
-    state.refreshPromise = (async () => {
+    state.sessionRefreshPromise = (async () => {
       const response = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=refresh_token`, {
         method: "POST",
         headers: apiHeaders(),
@@ -178,9 +211,9 @@
     })();
 
     try {
-      return await state.refreshPromise;
+      return await state.sessionRefreshPromise;
     } finally {
-      state.refreshPromise = null;
+      state.sessionRefreshPromise = null;
     }
   }
 
@@ -246,10 +279,23 @@
     elements.loginForm.querySelector("button").disabled = false;
   }
 
+  function isOwner() {
+    return state.profile?.role === "owner";
+  }
+
+  function moderatorRoleLabel(role) {
+    return role === "owner" ? "所有者" : "审核员";
+  }
+
   function showDashboard() {
     elements.loginView.hidden = true;
     elements.dashboardView.hidden = false;
     elements.adminIdentity.textContent = state.profile?.email || "管理员";
+    elements.adminRole.textContent = moderatorRoleLabel(state.profile?.role);
+    elements.adminRole.dataset.role = state.profile?.role || "reviewer";
+    elements.runtimeTab.hidden = !isOwner();
+    elements.runtimeOpenButton.hidden = !isOwner();
+    if (!isOwner() && state.view === "runtime") state.view = "questions";
   }
 
   function showToast(message, isError = false) {
@@ -274,6 +320,96 @@
 
   function directionLabel(direction) {
     return direction === "adult_to_child" ? "大人问 · 小朋友答" : "小朋友问 · 大人答";
+  }
+
+  function normalizeRuntimeSettings(value) {
+    if (!value || typeof value !== "object") return null;
+    return {
+      submissionsPaused: Boolean(value.submissionsPaused),
+      readOnly: Boolean(value.readOnly),
+      emergencyLockdown: Boolean(value.emergencyLockdown),
+      publicMessage: typeof value.publicMessage === "string" ? value.publicMessage : "",
+      updatedAt: value.updatedAt || null,
+    };
+  }
+
+  function runtimeDisplayState(settings = state.runtimeSettings) {
+    if (!settings) {
+      return {
+        key: "unknown",
+        shortLabel: "状态未知",
+        title: "站点状态暂不可用",
+        message: "刷新后仍无法读取时，请检查运营控制迁移。",
+      };
+    }
+    if (settings.emergencyLockdown) {
+      return {
+        key: "emergency",
+        shortLabel: "应急隐藏",
+        title: "维护 / 应急隐藏已启用",
+        message: settings.publicMessage || "公开内容和参与入口当前均已关闭。",
+      };
+    }
+    if (settings.readOnly) {
+      return {
+        key: "readonly",
+        shortLabel: "全站只读",
+        title: "全站只读已启用",
+        message: settings.publicMessage || "访客可以浏览，但不能提交内容。",
+      };
+    }
+    if (settings.submissionsPaused) {
+      return {
+        key: "paused",
+        shortLabel: "投稿暂停",
+        title: "新投稿已暂停",
+        message: settings.publicMessage || "浏览与举报保持可用，问题和回答暂不可提交。",
+      };
+    }
+    return {
+      key: "normal",
+      shortLabel: "运行正常",
+      title: "站点运行正常",
+      message: settings.publicMessage || "公开浏览和投稿入口均可使用。",
+    };
+  }
+
+  function setRuntimeFormDisabled(disabled) {
+    [
+      elements.runtimeSubmissionsPaused,
+      elements.runtimeReadOnly,
+      elements.runtimeEmergencyLockdown,
+      elements.runtimePublicMessage,
+      elements.runtimeSaveButton,
+    ].forEach((control) => {
+      control.disabled = disabled;
+    });
+  }
+
+  function renderRuntimeSettings() {
+    const settings = state.runtimeSettings;
+    const display = runtimeDisplayState(settings);
+    elements.runtimeIndicator.dataset.state = display.key;
+    elements.runtimeIndicator.textContent = display.shortLabel;
+    elements.runtimeBanner.dataset.state = display.key;
+    elements.runtimeBannerTitle.textContent = display.title;
+    elements.runtimeBannerMessage.textContent = display.message;
+
+    if (!settings) {
+      elements.runtimeUpdatedAt.textContent = "尚未读取到运行设置";
+      setRuntimeFormDisabled(true);
+      return;
+    }
+
+    elements.runtimeSubmissionsPaused.checked = settings.submissionsPaused;
+    elements.runtimeReadOnly.checked = settings.readOnly;
+    elements.runtimeEmergencyLockdown.checked = settings.emergencyLockdown;
+    elements.runtimePublicMessage.value = settings.publicMessage;
+    elements.runtimeMessageCount.textContent = String(settings.publicMessage.length);
+    elements.runtimeUpdatedAt.textContent = settings.updatedAt
+      ? `最近更新 ${formatDate(settings.updatedAt)}`
+      : "尚无更新时间";
+    setRuntimeFormDisabled(!isOwner() || Boolean(state.settingsSavePromise));
   }
 
   function statusLabel(status) {
@@ -345,8 +481,13 @@
     }
     if (queueMode) return;
     if (row.status === "open") {
-      container.append(actionButton("关闭回答", "close", options), actionButton("隐藏", "hide", { ...options, className: "is-danger" }));
-    } else if (["closed", "hidden", "rejected"].includes(row.status)) {
+      container.append(actionButton("关闭回答", "close", options), actionButton("应急隐藏", "hide", { ...options, className: "is-danger" }));
+    } else if (row.status === "closed") {
+      container.append(
+        actionButton("重新开放", "reopen", { ...options, className: "is-approve" }),
+        actionButton("应急隐藏", "hide", { ...options, className: "is-danger" }),
+      );
+    } else if (["hidden", "rejected"].includes(row.status)) {
       container.append(actionButton("重新开放", "reopen", { ...options, className: "is-approve" }));
     }
   }
@@ -364,7 +505,7 @@
     if (row.status === "published") {
       container.append(
         actionButton(row.featured ? "取消精选" : "设为精选", row.featured ? "unfeature" : "feature", options),
-        actionButton("隐藏", "hide", { ...options, className: "is-danger" }),
+        actionButton("应急隐藏", "hide", { ...options, className: "is-danger" }),
       );
     } else if (["hidden", "rejected"].includes(row.status)) {
       container.append(actionButton("重新发布", "publish", { ...options, className: "is-approve" }));
@@ -383,6 +524,11 @@
     const tags = createElement("div", "review-tags");
     tags.append(statusBadge(row.status), directionBadge(row.direction));
     main.append(meta, title, tags);
+    if (row.moderationReason) {
+      const note = createElement("p", "moderation-note");
+      note.append(createElement("strong", "", "处理原因"), document.createTextNode(row.moderationReason));
+      main.append(note);
+    }
 
     const actions = createElement("div", "review-actions");
     appendQuestionActions(actions, row, queueMode);
@@ -403,6 +549,11 @@
     const tags = createElement("div", "review-tags");
     tags.append(statusBadge(row.status), directionBadge(row.direction));
     main.append(meta, question, answer, tags);
+    if (row.moderationReason) {
+      const note = createElement("p", "moderation-note");
+      note.append(createElement("strong", "", "处理原因"), document.createTextNode(row.moderationReason));
+      main.append(note);
+    }
 
     const actions = createElement("div", "review-actions");
     appendAnswerActions(actions, row, queueMode);
@@ -447,15 +598,30 @@
     const meta = createElement("div", "review-meta");
     metaText(meta, formatDate(row.createdAt));
     metaText(meta, `${row.entityType} · ${row.action}`);
-    const title = createElement("p", "review-title", row.snapshot?.body || row.reason || "状态处理");
-    const change = createElement("div", "history-change");
-    change.append(
-      createElement("span", "", statusLabel(row.previousStatus || "-")),
-      createElement("span", "history-arrow", "→"),
-      createElement("span", "", statusLabel(row.nextStatus || "-")),
+    const settingsSnapshot = row.entityType === "settings" ? row.snapshot?.next : null;
+    const settingsSummary = settingsSnapshot
+      ? [
+          settingsSnapshot.emergencyLockdown ? "应急隐藏" : "",
+          settingsSnapshot.readOnly ? "全站只读" : "",
+          settingsSnapshot.submissionsPaused ? "暂停投稿" : "",
+        ].filter(Boolean).join("、") || "正常运行"
+      : "";
+    const title = createElement(
+      "p",
+      "review-title",
+      settingsSummary ? `运行设置：${settingsSummary}` : row.snapshot?.body || row.reason || "状态处理",
     );
+    const change = createElement("div", "history-change");
+    if (!settingsSummary) {
+      change.append(
+        createElement("span", "", statusLabel(row.previousStatus || "-")),
+        createElement("span", "history-arrow", "→"),
+        createElement("span", "", statusLabel(row.nextStatus || "-")),
+      );
+    }
     if (row.reason) change.append(createElement("span", "", `说明：${row.reason}`));
-    main.append(meta, title, change);
+    main.append(meta, title);
+    if (change.childNodes.length) main.append(change);
     item.append(main);
     return item;
   }
@@ -464,6 +630,17 @@
     elements.contentList.replaceChildren();
     elements.workspaceLoading.hidden = true;
     elements.workspaceError.hidden = true;
+    if (state.view === "runtime") {
+      elements.runtimePanel.hidden = false;
+      elements.contentList.hidden = true;
+      elements.workspaceEmpty.hidden = true;
+      elements.loadMoreButton.hidden = true;
+      renderRuntimeSettings();
+      return;
+    }
+
+    elements.runtimePanel.hidden = true;
+    elements.contentList.hidden = false;
     elements.workspaceEmpty.hidden = state.rows.length > 0;
     elements.loadMoreButton.hidden = !state.hasMore || !state.rows.length;
     if (!state.rows.length) return;
@@ -500,15 +677,21 @@
       else tab.removeAttribute("aria-current");
     });
 
-    const showSearch = state.view !== "reports" && state.view !== "history";
+    const showSearch = !["reports", "history", "runtime"].includes(state.view);
     elements.contentSearch.closest("label").hidden = !showSearch;
     elements.contentTypeField.hidden = state.view !== "content";
     elements.contentStatusField.hidden = state.view !== "content";
     if (state.view === "content") rebuildContentStatusOptions();
+    elements.runtimePanel.hidden = state.view !== "runtime";
+    if (state.view !== "runtime") elements.contentList.hidden = false;
   }
 
   async function loadSummary() {
     return rpc("admin_dashboard");
+  }
+
+  async function loadRuntimeSettings() {
+    return normalizeRuntimeSettings(await rpc("admin_get_runtime_settings"));
   }
 
   async function loadCurrentView(viewState, offset = 0) {
@@ -521,6 +704,8 @@
       return rpc("admin_list_reports", { p_status: "open", p_limit: pageSize, p_offset: offset });
     } else if (viewState.view === "history") {
       return rpc("admin_list_actions", { p_limit: pageSize, p_offset: offset });
+    } else if (viewState.view === "runtime") {
+      return [];
     } else if (viewState.contentType === "questions") {
       return rpc("admin_list_questions", { p_status: viewState.contentStatus || null, p_search: search, p_limit: pageSize, p_offset: offset });
     } else {
@@ -528,112 +713,162 @@
     }
   }
 
-  async function refreshWorkspace() {
-    const requestId = ++state.workspaceRequestId;
-    if (state.loading) {
-      state.refreshQueued = true;
-      return;
-    }
-
-    state.loading = true;
-    const viewState = {
+  function snapshotViewState() {
+    return {
       view: state.view,
       search: state.search,
       contentType: state.contentType,
       contentStatus: state.contentStatus,
     };
-    elements.refreshButton.disabled = true;
-    elements.workspaceLoading.hidden = false;
-    elements.workspaceEmpty.hidden = true;
-    elements.workspaceError.hidden = true;
-    elements.loadMoreButton.hidden = true;
-    elements.contentList.replaceChildren();
+  }
 
-    try {
-      const [summary, rows] = await Promise.all([loadSummary(), loadCurrentView(viewState)]);
-      if (requestId !== state.workspaceRequestId) return;
-      state.summary = summary;
-      state.rows = rows;
-      state.hasMore = rows.length === pageSize;
-      renderSummary();
-      renderRows();
-    } catch (error) {
-      if (requestId !== state.workspaceRequestId) return;
-      elements.workspaceLoading.hidden = true;
-      elements.workspaceError.hidden = false;
-      elements.workspaceError.textContent = error.message || "审核数据读取失败。";
-      if (error.status === 401 || error.status === 403) {
-        clearSession();
-        showLogin();
-        setLoginStatus("当前账号没有审核权限。", true);
-      }
-    } finally {
-      state.loading = false;
-      elements.refreshButton.disabled = false;
-      if (state.refreshQueued) {
-        state.refreshQueued = false;
-        void refreshWorkspace();
-      }
+  function setWorkspaceBusy(isBusy) {
+    elements.refreshButton.disabled = isBusy;
+    elements.refreshButton.textContent = isBusy ? "刷新中…" : "刷新";
+    elements.workspace.setAttribute("aria-busy", String(isBusy));
+  }
+
+  function handleWorkspaceError(error) {
+    elements.workspaceLoading.hidden = true;
+    elements.workspaceError.hidden = false;
+    elements.workspaceError.textContent = error.message || "审核数据读取失败。";
+    if (error.status === 401 || error.status === 403) {
+      state.workspaceRefreshQueued = false;
+      clearSession();
+      showLogin();
+      setLoginStatus("当前账号没有审核权限。", true);
     }
   }
 
-  async function loadMoreRows() {
-    if (state.loading || !state.hasMore) return;
-    const requestId = ++state.workspaceRequestId;
-    const viewState = {
-      view: state.view,
-      search: state.search,
-      contentType: state.contentType,
-      contentStatus: state.contentStatus,
-    };
-
-    state.loading = true;
-    elements.loadMoreButton.disabled = true;
-    elements.loadMoreButton.textContent = "正在加载…";
+  async function performWorkspaceRefresh(requestId) {
+    const viewState = snapshotViewState();
     try {
-      const rows = await loadCurrentView(viewState, state.rows.length);
+      const [summary, rows, runtimeSettings] = await Promise.all([
+        loadSummary(),
+        loadCurrentView(viewState),
+        loadRuntimeSettings(),
+      ]);
       if (requestId !== state.workspaceRequestId) return;
-      state.rows.push(...rows);
-      state.hasMore = rows.length === pageSize;
+
+      state.summary = summary || {};
+      state.rows = Array.isArray(rows) ? rows : [];
+      state.hasMore = state.rows.length === pageSize && viewState.view !== "runtime";
+      state.runtimeSettings = runtimeSettings;
+      renderSummary();
+      renderRuntimeSettings();
       renderRows();
     } catch (error) {
-      if (requestId === state.workspaceRequestId) {
-        showToast(error.message || "更多内容加载失败。", true);
+      if (requestId !== state.workspaceRequestId) return;
+      handleWorkspaceError(error);
+    }
+  }
+
+  function refreshWorkspace() {
+    state.workspaceRequestId += 1;
+    state.workspaceRefreshQueued = true;
+    elements.workspaceError.hidden = true;
+    elements.workspaceEmpty.hidden = true;
+    elements.loadMoreButton.hidden = true;
+    if (state.view !== "runtime") {
+      elements.runtimePanel.hidden = true;
+      elements.contentList.hidden = false;
+      elements.contentList.replaceChildren();
+      elements.workspaceLoading.hidden = false;
+    } else {
+      elements.contentList.hidden = true;
+      elements.workspaceLoading.hidden = true;
+      elements.runtimePanel.hidden = false;
+    }
+
+    if (state.workspaceRefreshPromise) return state.workspaceRefreshPromise;
+
+    setWorkspaceBusy(true);
+    state.workspaceRefreshPromise = (async () => {
+      while (state.workspaceRefreshQueued && state.session) {
+        state.workspaceRefreshQueued = false;
+        const requestId = state.workspaceRequestId;
+        await performWorkspaceRefresh(requestId);
       }
-    } finally {
-      state.loading = false;
+    })().finally(() => {
+      state.workspaceRefreshPromise = null;
+      setWorkspaceBusy(false);
+    });
+
+    return state.workspaceRefreshPromise;
+  }
+
+  function loadMoreRows() {
+    if (state.workspaceRefreshPromise || state.loadMorePromise || !state.hasMore || state.view === "runtime") {
+      return state.loadMorePromise || state.workspaceRefreshPromise || Promise.resolve();
+    }
+
+    const requestId = ++state.workspaceRequestId;
+    const viewState = snapshotViewState();
+    const offset = state.rows.length;
+    elements.loadMoreButton.disabled = true;
+    elements.loadMoreButton.textContent = "正在加载…";
+
+    state.loadMorePromise = (async () => {
+      try {
+        const rows = await loadCurrentView(viewState, offset);
+        if (requestId !== state.workspaceRequestId) return;
+        const nextRows = Array.isArray(rows) ? rows : [];
+        state.rows.push(...nextRows);
+        state.hasMore = nextRows.length === pageSize;
+        renderRows();
+      } catch (error) {
+        if (requestId === state.workspaceRequestId) {
+          showToast(error.message || "更多内容加载失败。", true);
+        }
+      }
+    })().finally(() => {
+      state.loadMorePromise = null;
       elements.loadMoreButton.disabled = false;
       elements.loadMoreButton.textContent = "加载更多";
-      if (state.refreshQueued) {
-        state.refreshQueued = false;
-        void refreshWorkspace();
-      }
-    }
+    });
+
+    return state.loadMorePromise;
   }
 
   function actionNeedsReason(action) {
     return ["reject", "hide", "resolve", "dismiss", "hide_and_resolve"].includes(action);
   }
 
+  function actionRequiresReason(action) {
+    return action === "reject";
+  }
+
   function openReasonDialog(action) {
     state.pendingAction = action;
     const label = {
       reject: "驳回内容",
-      hide: "隐藏内容",
+      hide: "应急隐藏内容",
       resolve: "解决举报",
       dismiss: "忽略举报",
       hide_and_resolve: "下架便签并解决举报",
     }[action.action] || "确认处理";
+    const required = actionRequiresReason(action.action);
     elements.reasonEyebrow.textContent = action.entityType === "report" ? "举报处置" : "内容审核";
     elements.reasonTitle.textContent = label;
     elements.reasonConfirm.textContent = label;
+    elements.reasonLabel.textContent = required ? "驳回原因（必填）" : "处理说明（建议填写）";
+    elements.reasonHint.textContent = required
+      ? "原因会反馈给提交者，并写入操作日志。"
+      : "建议记录判断依据，内容会写入操作日志。";
+    elements.reasonInput.placeholder = required ? "请说明未通过的具体原因和修改方向" : "记录风险、判断依据或后续动作";
+    elements.reasonInput.required = required;
+    elements.reasonInput.setCustomValidity("");
     elements.reasonInput.value = "";
+    elements.reasonCount.textContent = "0";
+    elements.reasonError.textContent = "";
     elements.reasonDialog.showModal();
     window.setTimeout(() => elements.reasonInput.focus(), 30);
   }
 
   async function executeAction(action, reason = "") {
-    const buttons = [...elements.contentList.querySelectorAll("button")];
+    const item = action.sourceItem?.isConnected ? action.sourceItem : null;
+    const buttons = item ? [...item.querySelectorAll("button")] : [];
+    item?.setAttribute("aria-busy", "true");
     buttons.forEach((button) => { button.disabled = true; });
     try {
       if (action.entityType === "question") {
@@ -646,13 +881,15 @@
       showToast("处理已保存并写入操作记录。");
       await refreshWorkspace();
     } catch (error) {
-      if (["23514", "P0002"].includes(error.code)) {
+      if (["23514", "P0002", "40001", "PGRST116"].includes(error.code) || error.status === 409) {
         showToast("内容状态已经变化，列表已刷新。", true);
         await refreshWorkspace();
       } else {
         showToast(error.message || "处理失败，请刷新后重试。", true);
         buttons.forEach((button) => { button.disabled = false; });
       }
+    } finally {
+      item?.removeAttribute("aria-busy");
     }
   }
 
@@ -665,9 +902,133 @@
       entityId: button.dataset.entityId,
       answerId: button.dataset.answerId || "",
       answerStatus: button.dataset.answerStatus || "",
+      sourceItem: button.closest(".review-item"),
     };
     if (actionNeedsReason(action.action)) openReasonDialog(action);
     else executeAction(action);
+  }
+
+  function setRuntimeFormStatus(message, isError = false) {
+    elements.runtimeFormStatus.textContent = message;
+    elements.runtimeFormStatus.classList.toggle("is-error", isError);
+  }
+
+  function readRuntimeForm() {
+    return {
+      submissionsPaused: elements.runtimeSubmissionsPaused.checked,
+      readOnly: elements.runtimeReadOnly.checked,
+      emergencyLockdown: elements.runtimeEmergencyLockdown.checked,
+      publicMessage: elements.runtimePublicMessage.value.trim(),
+    };
+  }
+
+  function runtimeSettingsEqual(left, right) {
+    if (!left || !right) return false;
+    return ["submissionsPaused", "readOnly", "emergencyLockdown", "publicMessage"]
+      .every((key) => left[key] === right[key]);
+  }
+
+  async function saveRuntimeSettings(nextSettings) {
+    if (!isOwner()) {
+      renderRuntimeSettings();
+      showToast("只有所有者可以修改运营开关。", true);
+      return;
+    }
+    if (state.settingsSavePromise) return state.settingsSavePromise;
+
+    state.settingsSavePromise = (async () => {
+      setRuntimeFormDisabled(true);
+      setRuntimeFormStatus("正在保存并写入操作记录…");
+      try {
+        const result = await rpc("admin_update_runtime_settings", {
+          p_submissions_paused: nextSettings.submissionsPaused,
+          p_read_only: nextSettings.readOnly,
+          p_emergency_lockdown: nextSettings.emergencyLockdown,
+          p_public_message: nextSettings.publicMessage || null,
+        });
+        state.runtimeSettings = normalizeRuntimeSettings(result);
+        renderRuntimeSettings();
+        setRuntimeFormStatus("运行设置已保存。即将同步最新状态。");
+        showToast(nextSettings.emergencyLockdown ? "应急隐藏已启用。" : "运行设置已更新。");
+        await refreshWorkspace();
+      } catch (error) {
+        const definiteRejection = error.status >= 400 && error.status < 500;
+        const authenticationFailure = error.status === 401 || error.status === 403 || error.code === "42501";
+
+        if (definiteRejection) {
+          renderRuntimeSettings();
+          setRuntimeFormStatus(error.message || "运行设置保存失败。", true);
+          showToast(error.message || "运行设置保存失败。", true);
+        } else {
+          state.runtimeSettings = null;
+          renderRuntimeSettings();
+          setRuntimeFormStatus("保存结果尚未确认，正在重新读取实际状态…", true);
+          showToast("保存结果未知，正在核对实际运行状态。", true);
+
+          try {
+            const refreshedSettings = await loadRuntimeSettings();
+            if (!refreshedSettings) throw new Error("运行状态响应无效。");
+            state.runtimeSettings = refreshedSettings;
+            renderRuntimeSettings();
+            setRuntimeFormStatus("已重新读取数据库中的实际状态。");
+            showToast("已重新读取实际运行状态。");
+          } catch (refreshError) {
+            state.runtimeSettings = null;
+            renderRuntimeSettings();
+            setRuntimeFormStatus("保存结果未知，且暂时无法读取实际状态。请恢复网络后刷新。", true);
+            showToast("当前状态无法确认，运营开关已锁定。", true);
+            if (refreshError.status === 401 || refreshError.status === 403 || refreshError.code === "42501") {
+              await refreshWorkspace();
+            }
+          }
+        }
+
+        if (authenticationFailure) {
+          await refreshWorkspace();
+        }
+      }
+    })().finally(() => {
+      state.settingsSavePromise = null;
+      setRuntimeFormDisabled(!isOwner() || !state.runtimeSettings);
+    });
+
+    return state.settingsSavePromise;
+  }
+
+  function requestRuntimeSave(nextSettings) {
+    if (!state.runtimeSettings) {
+      setRuntimeFormStatus("尚未读取到当前设置，请先刷新。", true);
+      return;
+    }
+    if (runtimeSettingsEqual(nextSettings, state.runtimeSettings)) {
+      setRuntimeFormStatus("没有需要保存的更改。", false);
+      return;
+    }
+    if (nextSettings.emergencyLockdown && !state.runtimeSettings.emergencyLockdown) {
+      if (!nextSettings.publicMessage) {
+        setRuntimeFormStatus("启用应急隐藏前，请填写面向访客的前台提示。", true);
+        elements.runtimePublicMessage.focus();
+        return;
+      }
+      state.pendingRuntimeSettings = nextSettings;
+      elements.emergencyAck.checked = false;
+      elements.emergencyDialog.showModal();
+      window.setTimeout(() => elements.emergencyAck.focus(), 30);
+      return;
+    }
+    void saveRuntimeSettings(nextSettings);
+  }
+
+  function selectView(nextView) {
+    if (!viewLabels[nextView] || (nextView === "runtime" && !isOwner())) return;
+    if (state.view === nextView) return;
+    state.view = nextView;
+    state.search = "";
+    state.rows = [];
+    state.hasMore = false;
+    elements.contentSearch.value = "";
+    updateViewChrome();
+    void refreshWorkspace();
   }
 
   async function initializeAuthenticatedView() {
@@ -702,12 +1063,7 @@
 
   elements.tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      if (state.view === tab.dataset.view) return;
-      state.view = tab.dataset.view;
-      state.search = "";
-      elements.contentSearch.value = "";
-      updateViewChrome();
-      refreshWorkspace();
+      selectView(tab.dataset.view);
     });
   });
 
@@ -715,7 +1071,7 @@
     window.clearTimeout(state.searchTimer);
     state.searchTimer = window.setTimeout(() => {
       state.search = elements.contentSearch.value.trim();
-      refreshWorkspace();
+      void refreshWorkspace();
     }, 350);
   });
 
@@ -723,31 +1079,85 @@
     state.contentType = elements.contentType.value;
     state.contentStatus = "";
     rebuildContentStatusOptions();
-    refreshWorkspace();
+    void refreshWorkspace();
   });
 
   elements.contentStatus.addEventListener("change", () => {
     state.contentStatus = elements.contentStatus.value;
-    refreshWorkspace();
+    void refreshWorkspace();
   });
 
-  elements.refreshButton.addEventListener("click", refreshWorkspace);
-  elements.loadMoreButton.addEventListener("click", loadMoreRows);
-  elements.logoutButton.addEventListener("click", signOut);
+  elements.refreshButton.addEventListener("click", () => { void refreshWorkspace(); });
+  elements.loadMoreButton.addEventListener("click", () => { void loadMoreRows(); });
+  elements.logoutButton.addEventListener("click", () => { void signOut(); });
   elements.contentList.addEventListener("click", handleReviewAction);
+  elements.runtimeOpenButton.addEventListener("click", () => selectView("runtime"));
+
+  elements.runtimePublicMessage.addEventListener("input", () => {
+    elements.runtimeMessageCount.textContent = String(elements.runtimePublicMessage.value.length);
+    setRuntimeFormStatus("");
+  });
+
+  elements.runtimeForm.addEventListener("change", () => {
+    setRuntimeFormStatus("");
+  });
+
+  elements.runtimeForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    requestRuntimeSave(readRuntimeForm());
+  });
 
   document.querySelector("[data-dialog-cancel]").addEventListener("click", () => {
     state.pendingAction = null;
     elements.reasonDialog.close();
   });
 
+  elements.reasonInput.addEventListener("input", () => {
+    elements.reasonCount.textContent = String(elements.reasonInput.value.length);
+    elements.reasonError.textContent = "";
+    elements.reasonInput.setCustomValidity("");
+  });
+
+  elements.reasonDialog.addEventListener("cancel", () => {
+    state.pendingAction = null;
+  });
+
   elements.reasonForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const action = state.pendingAction;
     const reason = elements.reasonInput.value.trim();
+    if (action && actionRequiresReason(action.action) && !reason) {
+      elements.reasonError.textContent = "驳回内容前必须填写具体原因。";
+      elements.reasonInput.setCustomValidity("请填写驳回原因");
+      elements.reasonInput.reportValidity();
+      elements.reasonInput.focus();
+      return;
+    }
+    elements.reasonInput.setCustomValidity("");
     state.pendingAction = null;
     elements.reasonDialog.close();
-    if (action) executeAction(action, reason);
+    if (action) void executeAction(action, reason);
+  });
+
+  document.querySelector("[data-emergency-cancel]").addEventListener("click", () => {
+    state.pendingRuntimeSettings = null;
+    elements.emergencyDialog.close();
+  });
+
+  elements.emergencyDialog.addEventListener("cancel", () => {
+    state.pendingRuntimeSettings = null;
+  });
+
+  elements.emergencyForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!elements.emergencyAck.checked) {
+      elements.emergencyAck.reportValidity();
+      return;
+    }
+    const nextSettings = state.pendingRuntimeSettings;
+    state.pendingRuntimeSettings = null;
+    elements.emergencyDialog.close();
+    if (nextSettings) void saveRuntimeSettings(nextSettings);
   });
 
   async function start() {

@@ -1,9 +1,12 @@
 const STORAGE_KEY = "question-wall-prototype-v1";
 const SESSION_KEY = "question-wall-prototype-session";
 const SEEN_NOTES_COOKIE_KEY = "question-wall-prototype-seen-v1";
+const HISTORY_STATE_KEY = "questionWallNavigation";
 const SEEN_NOTES_COOKIE_MAX_AGE = 60 * 60 * 24 * 180;
-const SEEN_NOTES_COOKIE_LIMIT = 80;
+const SEEN_NOTES_COOKIE_LIMIT = 100;
 const SWIPE_HINT_SESSION_KEY = "question-wall-swipe-hint-seen";
+const UNSAVED_RECEIPT_SESSION_KEY = "question-wall-unsaved-receipt-v1";
+const RUNTIME_POLL_INTERVAL_MS = 20_000;
 
 const seedNotes = [
   {
@@ -175,11 +178,20 @@ const backend = globalThis.QuestionWallBackend || { enabled: false, experienceMo
 let remoteNotes = [];
 let remoteQuestions = [];
 let remoteAvailable = false;
+let remoteLoadFailed = false;
+let runtimeStatus = {
+  schemaVersion: 0,
+  submissionsPaused: false,
+  readOnly: false,
+  emergencyLockdown: false,
+  publicMessage: "",
+};
 
 const sessionId = getOrCreateSessionId();
 const persisted = loadPersistedState();
 savePersistedState();
 const seenNoteIds = loadSeenNoteIds();
+const pendingReceiptFallback = loadPendingReceiptFallback();
 
 const ui = {
   route: getRouteFromHash(),
@@ -188,16 +200,27 @@ const ui = {
   pendingIntent: null,
   recommendationIds: [],
   recommendationIndex: -1,
+  recommendationComplete: false,
   feedMotion: "idle",
   showSwipeHint: shouldShowSwipeHint(),
+  statusSyncing: false,
+  editingSubmission: null,
+  receiptFallback: pendingReceiptFallback,
 };
+
+if (pendingReceiptFallback?.submission) {
+  ensureSubmissionInMemory(pendingReceiptFallback.type, pendingReceiptFallback.submission);
+}
 
 const app = document.getElementById("app");
 const dialog = document.getElementById("note-dialog");
 const dialogContent = document.getElementById("note-dialog-content");
 const toast = document.getElementById("toast");
 let toastTimer = null;
-let suppressNoteClickUntil = 0;
+let suppressClickUntil = 0;
+let navigationDepth = 0;
+let runtimeSyncPromise = null;
+let runtimePollTimer = null;
 
 document.addEventListener("DOMContentLoaded", async () => {
   app.addEventListener("click", handleClick);
@@ -209,52 +232,173 @@ document.addEventListener("DOMContentLoaded", async () => {
   app.addEventListener("touchcancel", handleTouchCancel, { passive: true });
   document.addEventListener("keydown", handleKeydown);
   dialog.addEventListener("click", handleDialogClick);
-  window.addEventListener("popstate", () => {
-    ui.route = getRouteFromHash();
-    render();
-  });
+  dialog.addEventListener("cancel", handleDialogCancel);
+  window.addEventListener("beforeunload", handleBeforeUnload);
+  prepareInitialRoute();
+  const initialOverlayNoteId = initializeNavigationHistory();
+  window.addEventListener("popstate", handlePopState);
   render();
+  if (initialOverlayNoteId) openNote(initialOverlayNoteId, { fromHistory: true });
 
   if (backend.enabled) {
     try {
-      await refreshRemoteContent({ resetRecommendations: true });
-      render();
+      await refreshRemoteSnapshot({ resetRecommendations: true });
     } catch (error) {
-      console.error("Unable to load shared question-wall content.", error);
-      showToast("在线内容暂时不可用，已进入本地演示模式。", true, 3200);
+      handleRemoteUnavailable(error);
+      showToast("在线内容暂时不可用，请稍后再试。", true, 3200);
     }
+    await refreshSubmissionStatuses({ silent: true, renderAfter: false });
+    render();
+    startRuntimeStatusPolling();
   }
 });
+
+async function refreshRemoteSnapshot({ resetRecommendations = false } = {}) {
+  const [nextRuntimeStatus, content] = await Promise.all([
+    backend.loadRuntimeStatus(),
+    backend.loadContent(),
+  ]);
+  runtimeStatus = nextRuntimeStatus;
+  remoteNotes = content.notes;
+  remoteQuestions = content.questions;
+  remoteAvailable = true;
+  remoteLoadFailed = false;
+
+  if (resetRecommendations) {
+    ui.recommendationIds = [];
+    ui.recommendationIndex = -1;
+  }
+  ui.recommendationComplete = false;
+}
 
 async function refreshRemoteContent({ resetRecommendations = false } = {}) {
   const content = await backend.loadContent();
   remoteNotes = content.notes;
   remoteQuestions = content.questions;
   remoteAvailable = true;
+  remoteLoadFailed = false;
 
   if (resetRecommendations) {
     ui.recommendationIds = [];
     ui.recommendationIndex = -1;
   }
+  ui.recommendationComplete = false;
+}
+
+function runtimeStatusChanged(previous, next) {
+  return ["submissionsPaused", "readOnly", "emergencyLockdown", "publicMessage"]
+    .some((key) => previous[key] !== next[key]);
+}
+
+function resetRemoteRecommendations() {
+  ui.recommendationIds = [];
+  ui.recommendationIndex = -1;
+  ui.recommendationComplete = false;
+}
+
+function handleRemoteUnavailable(error) {
+  console.error("Unable to verify the shared question-wall state.", error);
+  remoteNotes = [];
+  remoteQuestions = [];
+  remoteAvailable = false;
+  remoteLoadFailed = true;
+  resetRemoteRecommendations();
+}
+
+async function syncRuntimeStatus() {
+  if (!backend.enabled || runtimeSyncPromise) return runtimeSyncPromise;
+
+  runtimeSyncPromise = (async () => {
+    try {
+      const previous = runtimeStatus;
+      const next = await backend.loadRuntimeStatus();
+      const changed = runtimeStatusChanged(previous, next);
+      const needsContentRefresh = changed || !remoteAvailable;
+      runtimeStatus = next;
+
+      if (next.emergencyLockdown) {
+        remoteNotes = [];
+        remoteQuestions = [];
+        remoteAvailable = true;
+        remoteLoadFailed = false;
+        resetRemoteRecommendations();
+      } else if (needsContentRefresh) {
+        await refreshRemoteContent({ resetRecommendations: previous.emergencyLockdown });
+      }
+
+      if (needsContentRefresh) render();
+    } catch (error) {
+      handleRemoteUnavailable(error);
+      render();
+    }
+  })().finally(() => {
+    runtimeSyncPromise = null;
+  });
+
+  return runtimeSyncPromise;
+}
+
+function startRuntimeStatusPolling() {
+  window.clearInterval(runtimePollTimer);
+  runtimePollTimer = window.setInterval(() => {
+    if (document.visibilityState === "visible") void syncRuntimeStatus();
+  }, RUNTIME_POLL_INTERVAL_MS);
+  window.addEventListener("focus", () => { void syncRuntimeStatus(); });
+  window.addEventListener("online", () => { void syncRuntimeStatus(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void syncRuntimeStatus();
+  });
 }
 
 function getAvailableNotes() {
-  return remoteAvailable ? remoteNotes : seedNotes;
+  if (runtimeStatus.emergencyLockdown) return [];
+  if (backend.enabled) return remoteAvailable ? remoteNotes : [];
+  return seedNotes;
 }
 
 function getAvailableQuestions() {
-  return remoteAvailable ? remoteQuestions : seedQuestions;
+  if (runtimeStatus.emergencyLockdown) return [];
+  if (backend.enabled) return remoteAvailable ? remoteQuestions : [];
+  return seedQuestions;
 }
 
 function isExperienceMode() {
   return backend.enabled && backend.experienceMode;
 }
 
+function submissionsAreDisabled() {
+  return Boolean(
+    (backend.enabled && !remoteAvailable) ||
+      runtimeStatus.emergencyLockdown ||
+      runtimeStatus.readOnly ||
+      runtimeStatus.submissionsPaused,
+  );
+}
+
+function reportsAreDisabled() {
+  return Boolean(
+    (backend.enabled && !remoteAvailable) ||
+      runtimeStatus.emergencyLockdown ||
+      runtimeStatus.readOnly,
+  );
+}
+
+function runtimeMessage(fallback = "当前暂时不能提交内容。") {
+  if (backend.enabled && !remoteAvailable) {
+    return remoteLoadFailed ? "在线服务暂时不可用，请稍后再试。" : "正在确认站点状态，请稍候。";
+  }
+  return runtimeStatus.publicMessage || fallback;
+}
+
 function getOrCreateSessionId() {
-  const existing = localStorage.getItem(SESSION_KEY);
-  if (existing) return existing;
   const generated = globalThis.crypto?.randomUUID?.() || `session-${Date.now()}`;
-  localStorage.setItem(SESSION_KEY, generated);
+  try {
+    const existing = localStorage.getItem(SESSION_KEY);
+    if (existing) return existing;
+    localStorage.setItem(SESSION_KEY, generated);
+  } catch {
+    // The current page can still submit; the server-issued receipt becomes the recovery credential.
+  }
   return generated;
 }
 
@@ -331,7 +475,13 @@ function normalizeStoredQuestions(value) {
       answerCount: Number.isFinite(Number(item.answerCount)) ? Number(item.answerCount) : 0,
       anonymous: item.anonymous !== false,
       createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+      updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : null,
       authorSessionId: typeof item.authorSessionId === "string" ? item.authorSessionId : sessionId,
+      receipt: normalizeReceipt(item.receipt),
+      rejectionReason: typeof item.rejectionReason === "string" ? item.rejectionReason : "",
+      revision: Math.max(1, Number(item.revision || 1)),
+      eventIds: normalizeEventIds(item.eventIds),
+      latestEvent: normalizeLatestEvent(item.latestEvent),
     }));
 }
 
@@ -348,11 +498,170 @@ function normalizeStoredAnswers(value) {
       anonymous: item.anonymous !== false,
       status: typeof item.status === "string" ? item.status : "pending",
       createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+      updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : null,
+      receipt: normalizeReceipt(item.receipt),
+      rejectionReason: typeof item.rejectionReason === "string" ? item.rejectionReason : "",
+      revision: Math.max(1, Number(item.revision || 1)),
+      eventIds: normalizeEventIds(item.eventIds),
+      latestEvent: normalizeLatestEvent(item.latestEvent),
     }));
 }
 
+function normalizeReceipt(value) {
+  const receipt = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return /^[0-9a-f]{64}$/.test(receipt) ? receipt : "";
+}
+
+function normalizeEventIds(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((id) => Number(id))
+    .filter((id) => Number.isSafeInteger(id) && id > 0)
+    .slice(-40);
+}
+
+function normalizeLatestEvent(value) {
+  if (!value || typeof value !== "object" || typeof value.message !== "string") return null;
+  return {
+    type: typeof value.type === "string" ? value.type : "updated",
+    message: value.message,
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+  };
+}
+
 function savePersistedState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(persisted));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persisted));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function loadPendingReceiptFallback() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(UNSAVED_RECEIPT_SESSION_KEY));
+    const type = parsed?.type === "answer" ? "answer" : parsed?.type === "question" ? "question" : null;
+    const receipt = normalizeReceipt(parsed?.receipt);
+    if (!type || !receipt || !parsed?.submission) return null;
+    const normalized = type === "question"
+      ? normalizeStoredQuestions([{ ...parsed.submission, receipt }])[0]
+      : normalizeStoredAnswers([{ ...parsed.submission, receipt }])[0];
+    return normalized ? { type, receipt, submission: normalized } : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistPendingReceiptFallback(fallback) {
+  try {
+    sessionStorage.setItem(UNSAVED_RECEIPT_SESSION_KEY, JSON.stringify(fallback));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearPendingReceiptFallback() {
+  try {
+    sessionStorage.removeItem(UNSAVED_RECEIPT_SESSION_KEY);
+  } catch {
+    // The in-memory state is still cleared after the user confirms an external copy.
+  }
+}
+
+function handleBeforeUnload(event) {
+  if (!ui.receiptFallback) return;
+  event.preventDefault();
+  event.returnValue = "";
+}
+
+function ensureSubmissionInMemory(type, submission) {
+  const list = type === "answer" ? persisted.myAnswers : persisted.myQuestions;
+  const receipt = normalizeReceipt(submission?.receipt);
+  const existing = list.find((item) =>
+    item.id === submission?.id || (receipt && normalizeReceipt(item.receipt) === receipt));
+  if (existing) {
+    Object.assign(existing, submission, receipt ? { receipt } : {});
+    return existing;
+  }
+  const stored = { ...submission, ...(receipt ? { receipt } : {}) };
+  list.unshift(stored);
+  return stored;
+}
+
+function submissionReceiptIsPersisted(type, submission) {
+  const receipt = normalizeReceipt(submission?.receipt);
+  if (!receipt) return false;
+  try {
+    const storedState = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    const list = type === "answer" ? storedState?.myAnswers : storedState?.myQuestions;
+    return Array.isArray(list) && list.some((item) =>
+      item?.id === submission.id && normalizeReceipt(item.receipt) === receipt);
+  } catch {
+    return false;
+  }
+}
+
+function persistSubmissionReceipt(type, submission) {
+  return savePersistedState() && submissionReceiptIsPersisted(type, submission);
+}
+
+function finishSuccessfulSubmission({
+  type,
+  submission,
+  notification,
+  clearDraft,
+  remoteSucceeded,
+  successMessage,
+}) {
+  let receiptPersisted = !remoteSucceeded;
+  try {
+    ensureSubmissionInMemory(type, submission);
+    if (remoteSucceeded) receiptPersisted = persistSubmissionReceipt(type, submission);
+  } catch {
+    receiptPersisted = false;
+  }
+
+  try {
+    persisted.notifications.unshift(notification);
+  } catch {
+    // The submission record and server receipt are more important than a local convenience notice.
+  }
+
+  try {
+    clearDraft();
+  } catch {
+    // A stale local draft must never turn a successful remote write into a retry prompt.
+  }
+
+  const finalStateSaved = savePersistedState();
+  if (remoteSucceeded && !receiptPersisted && finalStateSaved) {
+    receiptPersisted = submissionReceiptIsPersisted(type, submission);
+  }
+
+  ui.mineTab = type === "answer" ? "answers" : "questions";
+  if (remoteSucceeded && !receiptPersisted) {
+    presentReceiptFallback(type, submission);
+    return;
+  }
+
+  showToast(successMessage, false, 2800);
+  navigate("mine");
+}
+
+function presentReceiptFallback(type, submission) {
+  const receipt = normalizeReceipt(submission?.receipt);
+  const fallback = {
+    type: type === "answer" ? "answer" : "question",
+    receipt,
+    submission: { ...submission, ...(receipt ? { receipt } : {}) },
+  };
+  ui.receiptFallback = fallback;
+  if (receipt) persistPendingReceiptFallback(fallback);
+  if (dialog.open) dialog.close();
+  render();
+  showToast("投稿已经成功，请先保存恢复码。", false, 4200);
 }
 
 function loadSeenNoteIds() {
@@ -363,7 +672,13 @@ function loadSeenNoteIds() {
       .find((item) => item.startsWith(encodedName));
     if (!cookie) return new Set();
 
-    const parsed = JSON.parse(decodeURIComponent(cookie.slice(encodedName.length)));
+    const decoded = decodeURIComponent(cookie.slice(encodedName.length));
+    let parsed;
+    try {
+      parsed = JSON.parse(decoded);
+    } catch {
+      parsed = decoded.split("~");
+    }
     if (!Array.isArray(parsed)) return new Set();
     return new Set(
       parsed
@@ -385,7 +700,7 @@ function rememberSeenNote(noteId) {
   [...latest].slice(-SEEN_NOTES_COOKIE_LIMIT).forEach((id) => seenNoteIds.add(id));
 
   try {
-    const value = encodeURIComponent(JSON.stringify([...seenNoteIds]));
+    const value = encodeURIComponent([...seenNoteIds].join("~"));
     document.cookie = `${encodeURIComponent(SEEN_NOTES_COOKIE_KEY)}=${value}; Max-Age=${SEEN_NOTES_COOKIE_MAX_AGE}; Path=/; SameSite=Lax`;
   } catch {
     // The in-memory set still prevents repeats for this visit when cookies are unavailable.
@@ -409,39 +724,216 @@ function dismissSwipeHint() {
   }
 }
 
-function getRouteFromHash() {
-  const rawHash = window.location.hash;
-  const route = rawHash.replace(/^#\/?/, "");
-  const allowed = ["home", "wall", "discover", "identity", "participate", "ask", "pool", "answer", "mine"];
-  if (!rawHash || !route) return "home";
+function normalizeRoute(route) {
+  const allowed = ["home", "wall", "identity", "participate", "ask", "pool", "answer", "mine"];
+  if (route === "discover") return "wall";
   return allowed.includes(route) ? route : "wall";
 }
 
-function navigate(route, options = {}) {
-  Object.assign(ui, options);
-  ui.route = route;
-  const nextHash = `#${route}`;
-  if (window.location.hash !== nextHash) {
-    window.history.pushState({ route }, "", nextHash);
+function getRouteFromHash() {
+  const rawHash = window.location.hash;
+  const route = rawHash.replace(/^#\/?/, "");
+  if (!rawHash || !route) return "home";
+  return normalizeRoute(route);
+}
+
+function prepareInitialRoute() {
+  if (persisted.role) return;
+
+  if (ui.route === "ask") {
+    ui.pendingIntent = { type: "ask" };
+    ui.route = "identity";
+  } else if (ui.route === "pool" || ui.route === "answer") {
+    ui.pendingIntent = { type: "answer", questionId: ui.selectedQuestionId || null };
+    ui.route = "identity";
+  } else if (ui.route === "participate") {
+    ui.pendingIntent = { type: "navigate", route: "participate" };
+    ui.route = "identity";
   }
+}
+
+function getNavigationSnapshot(state = window.history.state) {
+  const snapshot = state?.[HISTORY_STATE_KEY];
+  return snapshot && typeof snapshot === "object" ? snapshot : null;
+}
+
+function createNavigationState({ overlayNoteId = null } = {}) {
+  return {
+    [HISTORY_STATE_KEY]: {
+      route: ui.route,
+      depth: navigationDepth,
+      selectedQuestionId: ui.selectedQuestionId || null,
+      overlayNoteId,
+    },
+  };
+}
+
+function initializeNavigationHistory() {
+  const snapshot = getNavigationSnapshot();
+  if (Number.isInteger(snapshot?.depth) && snapshot.depth >= 0) {
+    navigationDepth = snapshot.depth;
+  }
+  if (typeof snapshot?.selectedQuestionId === "string") {
+    ui.selectedQuestionId = snapshot.selectedQuestionId;
+  }
+
+  const overlayNoteId = typeof snapshot?.overlayNoteId === "string" ? snapshot.overlayNoteId : null;
+  window.history.replaceState(createNavigationState({ overlayNoteId }), "", `#${ui.route}`);
+  return overlayNoteId;
+}
+
+function navigate(route, options = {}) {
+  const { replace = false, preserveIntent = false, ...stateUpdates } = options;
+  const nextRoute = normalizeRoute(route);
+  if (ui.route === "identity" && nextRoute !== "identity" && !preserveIntent) {
+    ui.pendingIntent = null;
+  }
+
+  Object.assign(ui, stateUpdates);
+  ui.route = nextRoute;
+  const nextHash = `#${nextRoute}`;
+  const sameRoute = window.location.hash === nextHash;
+
+  if (replace || sameRoute) {
+    window.history.replaceState(createNavigationState(), "", nextHash);
+  } else {
+    navigationDepth += 1;
+    window.history.pushState(createNavigationState(), "", nextHash);
+  }
+
   window.scrollTo({ top: 0, behavior: "smooth" });
   render();
 }
 
+function goBack(fallbackRoute = "wall") {
+  ui.pendingIntent = null;
+  if (navigationDepth > 0) {
+    window.history.back();
+    return;
+  }
+  navigate(fallbackRoute, { replace: true });
+}
+
+function handlePopState(event) {
+  const snapshot = getNavigationSnapshot(event.state);
+  navigationDepth = Number.isInteger(snapshot?.depth) && snapshot.depth >= 0 ? snapshot.depth : 0;
+  ui.route = getRouteFromHash();
+  ui.pendingIntent = null;
+  ui.selectedQuestionId = typeof snapshot?.selectedQuestionId === "string" ? snapshot.selectedQuestionId : null;
+
+  if (dialog.open) dialog.close();
+  render();
+
+  if (typeof snapshot?.overlayNoteId === "string") {
+    openNote(snapshot.overlayNoteId, { fromHistory: true });
+  }
+}
+
 function render() {
-  const content = renderRoute();
-  const isLanding = ui.route === "home";
-  const isFeed = ui.route === "wall" || ui.route === "discover";
-  const hasMobileNav = !isLanding && !["identity", "ask", "answer"].includes(ui.route);
+  const hasReceiptFallback = Boolean(ui.receiptFallback);
+  const content = hasReceiptFallback ? renderReceiptFallbackPage() : renderRoute();
+  const isLanding = !hasReceiptFallback && ui.route === "home";
+  const isFeed = !hasReceiptFallback && ui.route === "wall";
+  const hasMobileNav = !hasReceiptFallback && !isLanding && !["identity", "ask", "answer"].includes(ui.route);
+  const runtimeNotice = hasReceiptFallback ? "" : renderRuntimeNotice(isLanding);
   app.innerHTML = `
-    <div class="app-shell${hasMobileNav ? " has-mobile-nav" : ""}${isLanding ? " landing-shell" : ""}${isFeed ? " feed-shell" : ""}">
-      ${isLanding ? "" : renderTopbar()}
+    <div class="app-shell${hasMobileNav ? " has-mobile-nav" : ""}${isLanding ? " landing-shell" : ""}${isFeed ? " feed-shell" : ""}${runtimeNotice ? " has-runtime-notice" : ""}">
+      ${isLanding || hasReceiptFallback ? "" : renderTopbar()}
+      ${runtimeNotice}
       <main id="main-content" class="page-main" tabindex="-1">${content}</main>
       ${hasMobileNav ? renderMobileNav() : ""}
     </div>
   `;
   ui.feedMotion = "idle";
   refreshIcons();
+}
+
+function renderReceiptFallbackPage() {
+  const fallback = ui.receiptFallback;
+  if (!fallback) return "";
+  const subject = fallback.type === "answer" ? "回答" : "问题";
+  const receipt = normalizeReceipt(fallback.receipt);
+  return `
+    <section class="page-inner" aria-labelledby="receipt-fallback-title" aria-live="assertive">
+      <div class="page-heading-row">
+        <div>
+          <p class="page-kicker">${subject}已提交成功</p>
+          <h1 id="receipt-fallback-title">请先保存恢复码</h1>
+          <p class="page-subtitle">这台设备没能自动保存投稿记录。不要再次提交同一内容。</p>
+        </div>
+        ${statusLabel("pending")}
+      </div>
+
+      <div class="content-list submission-list" role="alert">
+        <article class="submission-row">
+          <p class="submission-feedback">
+            <strong>离开前必须处理</strong>
+            恢复码是以后查询审核结果和修改重投的唯一凭证。请复制到安全位置，不要公开分享。
+          </p>
+          ${
+            receipt
+              ? `<div class="receipt-code">
+                  <p class="content-row-meta">64 位恢复码</p>
+                  <code id="unsaved-receipt-code" tabindex="0">${escapeHtml(receipt)}</code>
+                </div>
+                <div class="form-actions">
+                  <button class="button button-primary" type="button" data-action="copy-unsaved-receipt">
+                    ${icon("copy")} 复制恢复码
+                  </button>
+                </div>`
+              : `<p class="submission-feedback">
+                  <strong>恢复码未能读取</strong>
+                  投稿仍然成功，请不要重复提交，并联系运营人员说明投稿 ID：${escapeHtml(fallback.submission?.id || "未知")}
+                </p>`
+          }
+          <label class="switch-label" for="receipt-saved-confirmation">
+            <input id="receipt-saved-confirmation" type="checkbox" />
+            我已经把恢复码保存到安全位置
+          </label>
+          <div class="form-actions">
+            <button class="button" type="button" data-action="acknowledge-unsaved-receipt">
+              已保存，继续
+            </button>
+          </div>
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderRuntimeNotice(isLanding) {
+  if (
+    (!backend.enabled || remoteAvailable) &&
+    !runtimeStatus.emergencyLockdown &&
+    !runtimeStatus.readOnly &&
+    !runtimeStatus.submissionsPaused &&
+    !runtimeStatus.publicMessage
+  ) {
+    return "";
+  }
+
+  let state = "notice";
+  let title = "站点提醒";
+  if (backend.enabled && !remoteAvailable) {
+    state = "unavailable";
+    title = remoteLoadFailed ? "在线服务暂时不可用" : "正在连接问答墙";
+  } else if (runtimeStatus.emergencyLockdown) {
+    state = "emergency";
+    title = "问答墙暂时关闭";
+  } else if (runtimeStatus.readOnly) {
+    state = "readonly";
+    title = "当前为只读模式";
+  } else if (runtimeStatus.submissionsPaused) {
+    state = "paused";
+    title = "投稿暂时暂停";
+  }
+
+  return `
+    <aside class="runtime-notice runtime-notice-${state}${isLanding ? " is-landing" : ""}" role="status">
+      ${icon(state === "emergency" ? "shield-alert" : "info")}
+      <span><strong>${title}</strong>${escapeHtml(runtimeMessage("浏览仍然开放，请稍后再来参与。"))}</span>
+    </aside>
+  `;
 }
 
 function renderRoute() {
@@ -460,8 +952,6 @@ function renderRoute() {
       return persisted.role && ui.selectedQuestionId
         ? renderAnswerPage()
         : renderPoolPage();
-    case "discover":
-      return renderDiscoverPage();
     case "mine":
       return renderMinePage();
     case "wall":
@@ -483,12 +973,12 @@ function renderLandingPage() {
         <p class="landing-copy">你可以先问，也可以先回答。每一张便签，都是一次认真听见。</p>
 
         <div class="landing-actions">
-          <button class="landing-action landing-action-ask" type="button" data-action="landing-ask">
+          <button class="landing-action landing-action-ask" type="button" data-action="landing-ask"${submissionsAreDisabled() ? " disabled" : ""}>
             <span class="landing-action-icon">${icon("message-circle-question")}</span>
             <span>我要提问</span>
             ${icon("arrow-up-right")}
           </button>
-          <button class="landing-action landing-action-answer" type="button" data-action="landing-answer">
+          <button class="landing-action landing-action-answer" type="button" data-action="landing-answer"${submissionsAreDisabled() ? " disabled" : ""}>
             <span class="landing-action-icon">${icon("messages-square")}</span>
             <span>我要回答</span>
             ${icon("arrow-up-right")}
@@ -509,6 +999,9 @@ function renderLandingPage() {
 
 function renderTopbar() {
   const roleLabel = persisted.role ? roleName(persisted.role) : "选择身份";
+  const isChoosingIdentity =
+    ui.route === "identity" ||
+    (!persisted.role && ["participate", "ask", "pool", "answer"].includes(ui.route));
   return `
     <header class="topbar-wrap">
       <div class="topbar">
@@ -529,12 +1022,16 @@ function renderTopbar() {
           ${desktopNavButton("mine", "我的")}
         </nav>
 
-        <div class="topbar-actions">
-          <button class="button identity-button" type="button" data-action="choose-role" aria-label="当前身份：${escapeHtml(roleLabel)}">
-            ${icon(persisted.role === "adult" ? "briefcase-business" : persisted.role === "child" ? "sparkles" : "user-round")}
-            <span class="role-button-text">${escapeHtml(roleLabel)}</span>
-          </button>
-        </div>
+        ${
+          isChoosingIdentity
+            ? ""
+            : `<div class="topbar-actions">
+                <button class="button identity-button" type="button" data-action="choose-role" aria-label="当前身份：${escapeHtml(roleLabel)}">
+                  ${icon(persisted.role === "adult" ? "briefcase-business" : persisted.role === "child" ? "sparkles" : "user-round")}
+                  <span class="role-button-text">${escapeHtml(roleLabel)}</span>
+                </button>
+              </div>`
+        }
       </div>
     </header>
   `;
@@ -567,7 +1064,7 @@ function mobileNavButton(route, iconName, label) {
 
 function navRouteIsCurrent(route) {
   if (route === "wall") {
-    return ui.route === "wall" || ui.route === "discover";
+    return ui.route === "wall";
   }
   if (route === "participate") {
     return ["identity", "participate", "ask", "pool", "answer"].includes(ui.route);
@@ -579,12 +1076,11 @@ function renderWallPage() {
   return renderRecommendationPage();
 }
 
-function renderDiscoverPage() {
-  return renderRecommendationPage();
-}
-
 function renderRecommendationPage() {
-  const note = getCurrentRecommendation();
+  if (backend.enabled && !remoteAvailable) {
+    return renderRemoteAvailabilityState();
+  }
+  const note = ui.recommendationComplete ? null : getCurrentRecommendation();
   return `
     <section class="recommendation-page" aria-label="推荐问答">
       <div class="recommendation-content">
@@ -594,9 +1090,29 @@ function renderRecommendationPage() {
   `;
 }
 
+function renderRemoteAvailabilityState() {
+  return `
+    <section class="recommendation-page" aria-label="问答墙状态">
+      <div class="recommendation-content">
+        <section class="single-note-viewer recommendation-end-viewer" aria-label="在线内容状态">
+          <div class="single-note-stage">
+            <div class="recommendation-end" role="status">
+              <span class="recommendation-end-icon" aria-hidden="true">${icon(remoteLoadFailed ? "cloud-off" : "loader-circle")}</span>
+              <div>
+                <p class="page-kicker">在线问答墙</p>
+                <h1>${remoteLoadFailed ? "暂时无法读取便签" : "正在连接"}</h1>
+                <p>${remoteLoadFailed ? "连接恢复后会自动重新加载。" : "正在确认最新内容和运行状态。"}</p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  `;
+}
+
 function renderSingleNoteViewer(note) {
   const canGoBack = ui.recommendationIndex > 0;
-  const canGoForward = ui.recommendationIndex < ui.recommendationIds.length - 1 || Boolean(peekNextRecommendation());
   return `
     <section class="single-note-viewer feed-motion-${ui.feedMotion}" aria-label="单张便签浏览">
       <div class="single-note-viewer-head">
@@ -607,7 +1123,7 @@ function renderSingleNoteViewer(note) {
           ${icon("chevron-up")}
         </button>
         ${renderNoteCard(note)}
-        <button class="single-note-nav single-note-nav-next" type="button" data-action="wall-next" aria-label="下一张便签"${canGoForward ? "" : " disabled"}>
+        <button class="single-note-nav single-note-nav-next" type="button" data-action="wall-next" aria-label="下一张便签">
           ${icon("chevron-down")}
         </button>
       </div>
@@ -647,7 +1163,10 @@ function getCurrentRecommendation() {
   if (current) return current;
 
   const next = peekNextRecommendation();
-  if (!next) return null;
+  if (!next) {
+    ui.recommendationComplete = true;
+    return null;
+  }
   ui.recommendationIds.push(next.id);
   ui.recommendationIndex = ui.recommendationIds.length - 1;
   rememberSeenNote(next.id);
@@ -680,15 +1199,36 @@ function renderNoteCard(note) {
 }
 
 function renderRecommendationEnd() {
+  const canGoBack = ui.recommendationIds.length > 0;
   return `
-    <div class="recommendation-end" role="status">
-      <span class="recommendation-end-icon" aria-hidden="true">${icon("check")}</span>
-      <div>
-        <p class="page-kicker">已经看到这里</p>
-        <h1>这一批便签看完了</h1>
-        <p>有新便签时，推荐会从这里继续。</p>
+    <section class="single-note-viewer recommendation-end-viewer feed-motion-${ui.feedMotion}" aria-label="推荐结束">
+      <div class="single-note-viewer-head">
+        <span class="recommendation-label">${icon("sparkles")} 推荐</span>
       </div>
-    </div>
+      <div class="single-note-stage">
+        <button class="single-note-nav single-note-nav-prev" type="button" data-action="wall-prev" aria-label="上一张便签"${canGoBack ? "" : " disabled"}>
+          ${icon("chevron-up")}
+        </button>
+        <div class="recommendation-end" role="status">
+          <span class="recommendation-end-icon" aria-hidden="true">${icon(canGoBack ? "check" : "clock-3")}</span>
+          <div>
+            <p class="page-kicker">${canGoBack ? "已经看到这里" : "便签正在路上"}</p>
+            <h1>${canGoBack ? "这一批便签看完了" : "暂时没有公开便签"}</h1>
+            <p>${canGoBack ? "有新便签时，推荐会从这里继续。" : "新的问答通过审核后会出现在这里。"}</p>
+          </div>
+        </div>
+      </div>
+      <div class="single-note-viewer-foot">
+        ${
+          canGoBack
+            ? `<span class="single-note-gesture-hint">
+                <span class="single-note-gesture-icon" aria-hidden="true">↓</span>
+                下滑回看
+              </span>`
+            : ""
+        }
+      </div>
+    </section>
   `;
 }
 
@@ -700,7 +1240,7 @@ function renderIdentityPage() {
           <p class="page-kicker">参与身份</p>
           <h1>今天以谁的身份参与？</h1>
         </div>
-        <button class="button button-ghost" type="button" data-action="continue-browsing">
+        <button class="button button-ghost" type="button" data-action="go-back" data-fallback-route="wall">
           ${icon("arrow-left")}
           继续逛逛
         </button>
@@ -743,7 +1283,7 @@ function renderParticipatePage() {
       ${renderIdentityBar()}
 
       <div class="action-grid">
-        <button class="action-choice" type="button" data-action="start-ask">
+        <button class="action-choice" type="button" data-action="start-ask"${submissionsAreDisabled() ? " disabled" : ""}>
           <span class="choice-icon">${icon("message-circle-question")}</span>
           <span class="choice-copy">
             <span class="choice-action">开始提问 ${icon("arrow-right")}</span>
@@ -751,7 +1291,7 @@ function renderParticipatePage() {
             <p>把一个问题交给${askTarget}</p>
           </span>
         </button>
-        <button class="action-choice" type="button" data-action="start-answer">
+        <button class="action-choice" type="button" data-action="start-answer"${submissionsAreDisabled() ? " disabled" : ""}>
           <span class="choice-icon">${icon("messages-square")}</span>
           <span class="choice-copy">
             <span class="choice-action">进入问题池 ${icon("arrow-right")}</span>
@@ -789,7 +1329,7 @@ function renderAskPage() {
           <p class="page-kicker">${roleName(role)}提问</p>
           <h1>问${target}一个问题</h1>
         </div>
-        <button class="button button-ghost" type="button" data-action="navigate" data-route="participate">
+        <button class="button button-ghost" type="button" data-action="go-back" data-fallback-route="participate">
           ${icon("arrow-left")}
           返回
         </button>
@@ -819,9 +1359,9 @@ function renderAskPage() {
 
             <div class="form-actions">
               <span class="autosave-label">${icon("save")} 草稿已自动保存</span>
-              <button class="button ${role === "adult" ? "button-adult" : "button-child"}" type="submit">
+              <button class="button ${role === "adult" ? "button-adult" : "button-child"}" type="submit"${submissionsAreDisabled() ? " disabled" : ""}>
                 ${icon("send")}
-                ${isExperienceMode() ? "发布问题" : "提交审核"}
+                ${submissionsAreDisabled() ? "暂停提交" : isExperienceMode() ? "发布问题" : "提交审核"}
               </button>
             </div>
           </div>
@@ -848,7 +1388,7 @@ function renderPoolPage() {
           <h1>${sourceRole}正在问</h1>
           <p class="page-subtitle">${questions.length} 个问题在等你的回答。</p>
         </div>
-        <button class="button button-primary" type="button" data-action="random-question">
+        <button class="button button-primary" type="button" data-action="random-question"${submissionsAreDisabled() || !questions.length ? " disabled" : ""}>
           ${icon("shuffle")}
           随机抽一道
         </button>
@@ -884,6 +1424,7 @@ function renderQuestionCard(question) {
       data-action="answer-question"
       data-question-id="${question.id}"
       aria-label="回答问题：${escapeHtml(question.body)}"
+      ${submissionsAreDisabled() ? "disabled" : ""}
     >
       <span class="direction-label ${direction.className}">${direction.label}</span>
       <span class="question-card-title">${escapeHtml(question.body)}</span>
@@ -894,11 +1435,12 @@ function renderQuestionCard(question) {
 }
 
 function renderPoolEmptyState() {
+  const paused = submissionsAreDisabled();
   return `
     <div class="empty-state">
       <div class="empty-state-inner">
-        <h2>暂时没有待回答问题</h2>
-        <p>新的问题会出现在这里，也可以去问答墙随便看看。</p>
+        <h2>${paused ? "问题池暂时停用" : "暂时没有待回答问题"}</h2>
+        <p>${escapeHtml(paused ? runtimeMessage("恢复投稿后，这里会重新开放。") : "新的问题会出现在这里，也可以去问答墙随便看看。")}</p>
         <button class="button button-primary" type="button" data-action="navigate" data-route="wall">去问答墙看看</button>
       </div>
     </div>
@@ -916,9 +1458,9 @@ function renderAnswerPage() {
           <p class="page-kicker">${roleName(persisted.role)}回答</p>
           <h1>写下你的回答</h1>
         </div>
-        <button class="button button-ghost" type="button" data-action="navigate" data-route="pool">
+        <button class="button button-ghost" type="button" data-action="go-back" data-fallback-route="pool">
           ${icon("arrow-left")}
-          返回问题池
+          返回
         </button>
       </div>
 
@@ -951,9 +1493,9 @@ function renderAnswerPage() {
 
             <div class="form-actions">
               <span class="autosave-label">${icon("save")} 草稿已自动保存</span>
-              <button class="button ${persisted.role === "adult" ? "button-adult" : "button-child"}" type="submit">
+              <button class="button ${persisted.role === "adult" ? "button-adult" : "button-child"}" type="submit"${submissionsAreDisabled() ? " disabled" : ""}>
                 ${icon("send")}
-                ${isExperienceMode() ? "发布回答" : "提交审核"}
+                ${submissionsAreDisabled() ? "暂停提交" : isExperienceMode() ? "发布回答" : "提交审核"}
               </button>
             </div>
           </div>
@@ -984,22 +1526,7 @@ function renderPreviewNote({ direction, question, answer }) {
 }
 
 function renderMinePage() {
-  if (!persisted.role && !persisted.myQuestions.length && !persisted.myAnswers.length) {
-    return `
-      <div class="page-inner">
-        <div class="page-heading-row">
-          <div>
-            <p class="page-kicker">我的</p>
-            <h1>选择身份后开始记录问答</h1>
-          </div>
-        </div>
-        <div class="role-grid">
-          ${roleChoice("adult", "user-round", "我是大人", "查看和管理大人身份下的参与记录")}
-          ${roleChoice("child", "user-round", "我是小朋友", "查看和管理小朋友身份下的参与记录")}
-        </div>
-      </div>
-    `;
-  }
+  const trackedCount = [...persisted.myQuestions, ...persisted.myAnswers].filter((item) => item.receipt).length;
 
   return `
     <div class="page-inner">
@@ -1008,9 +1535,26 @@ function renderMinePage() {
           <p class="page-kicker">我的</p>
           <h1>${persisted.role ? roleName(persisted.role) : "参与记录"}</h1>
         </div>
+        ${
+          backend.enabled && trackedCount
+            ? `<button class="button button-ghost mine-sync-button" type="button" data-action="sync-submissions"${ui.statusSyncing ? " disabled" : ""}>
+                ${icon("refresh-cw")}
+                ${ui.statusSyncing ? "同步中" : "刷新状态"}
+              </button>`
+            : ""
+        }
       </div>
 
-      ${persisted.role ? renderIdentityBar() : ""}
+      ${
+        persisted.role
+          ? renderIdentityBar()
+          : `<div class="role-grid mine-role-grid">
+              ${roleChoice("adult", "user-round", "我是大人", "查看和管理大人身份下的参与记录")}
+              ${roleChoice("child", "user-round", "我是小朋友", "查看和管理小朋友身份下的参与记录")}
+            </div>`
+      }
+
+      ${backend.enabled ? renderReceiptImport() : ""}
 
       <div class="mine-tabs" role="tablist" aria-label="我的内容">
         ${mineTabButton("questions", "我的提问")}
@@ -1024,6 +1568,22 @@ function renderMinePage() {
   `;
 }
 
+function renderReceiptImport() {
+  return `
+    <details class="receipt-import">
+      <summary>${icon("key-round")} 在这台设备恢复投稿</summary>
+      <form class="receipt-import-form" data-form="import-receipt">
+        <label for="receipt-code">恢复码</label>
+        <div class="receipt-import-controls">
+          <input id="receipt-code" name="receipt" type="text" inputmode="text" minlength="64" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="64 位恢复码" required />
+          <button class="button button-primary" type="submit">导入</button>
+        </div>
+        <p>恢复码相当于投稿凭证，请勿公开分享。</p>
+      </form>
+    </details>
+  `;
+}
+
 function mineTabButton(value, label) {
   return `<button class="mine-tab" type="button" role="tab" data-action="mine-tab" data-value="${value}" aria-selected="${ui.mineTab === value}">${label}</button>`;
 }
@@ -1031,12 +1591,12 @@ function mineTabButton(value, label) {
 function renderMineTabContent() {
   if (ui.mineTab === "questions") {
     if (!persisted.myQuestions.length) return mineEmpty("还没有提问", "去问一个真正想知道的问题", "start-ask", "提个问题");
-    return `<div class="content-list">${persisted.myQuestions.map((item) => contentRow(item.body, `${directionMeta(item.direction).label} · ${item.anonymous === false ? "公开身份" : "匿名"}`, item.status)).join("")}</div>`;
+    return `<div class="content-list submission-list">${persisted.myQuestions.map((item) => renderSubmissionRow(item, "question")).join("")}</div>`;
   }
 
   if (ui.mineTab === "answers") {
     if (!persisted.myAnswers.length) return mineEmpty("还没有回答", "问题池里有人正在等你的想法", "start-answer", "去回答");
-    return `<div class="content-list">${persisted.myAnswers.map((item) => contentRow(item.body, `回答：${item.questionBody} · ${item.anonymous === false ? "公开身份" : "匿名"}`, item.status)).join("")}</div>`;
+    return `<div class="content-list submission-list">${persisted.myAnswers.map((item) => renderSubmissionRow(item, "answer")).join("")}</div>`;
   }
 
   if (ui.mineTab === "favorites") {
@@ -1047,6 +1607,68 @@ function renderMineTabContent() {
 
   if (!persisted.notifications.length) return mineEmpty("暂时没有消息", "收到回答和审核结果后会出现在这里", "navigate", "去问答墙", "wall");
   return `<div class="content-list">${persisted.notifications.map((item) => contentRow(item.title, item.detail, item.read ? "published" : "pending")).join("")}</div>`;
+}
+
+function renderSubmissionRow(item, type) {
+  const direction = type === "question" ? directionMeta(item.direction).label : `回答：${item.questionBody}`;
+  const editing = ui.editingSubmission?.type === type && ui.editingSubmission?.id === item.id;
+  return `
+    <article class="submission-row">
+      <div class="submission-row-head">
+        <div class="content-row-main">
+          <p class="content-row-title">${escapeHtml(item.body)}</p>
+          <p class="content-row-meta">${escapeHtml(direction)} · ${item.anonymous === false ? "公开身份" : "匿名"}${item.revision > 1 ? ` · 第 ${item.revision} 版` : ""}</p>
+        </div>
+        ${statusLabel(item.status)}
+      </div>
+      ${item.rejectionReason ? `<p class="submission-feedback"><strong>审核说明</strong>${escapeHtml(item.rejectionReason)}</p>` : ""}
+      ${item.latestEvent ? `<p class="submission-latest">${escapeHtml(item.latestEvent.message)} · ${formatDate(item.latestEvent.createdAt)}</p>` : ""}
+      ${renderSubmissionActions(item, type)}
+      ${editing ? renderResubmitForm(item, type) : ""}
+    </article>
+  `;
+}
+
+function renderSubmissionActions(item, type) {
+  if (!item.receipt) {
+    return `<p class="submission-legacy">旧版本机记录，无法同步线上状态</p>`;
+  }
+  return `
+    <div class="submission-actions">
+      ${
+        item.status === "rejected"
+          ? `<button class="button button-primary" type="button" data-action="edit-submission" data-type="${type}" data-id="${item.id}">
+              ${icon("pencil-line")} 修改并重投
+            </button>`
+          : ""
+      }
+      <details class="receipt-code">
+        <summary>${icon("key-round")} 恢复码</summary>
+        <code>${escapeHtml(item.receipt)}</code>
+        <button class="button button-ghost" type="button" data-action="copy-receipt" data-type="${type}" data-id="${item.id}" aria-label="复制恢复码">
+          ${icon("copy")} 复制
+        </button>
+      </details>
+    </div>
+  `;
+}
+
+function renderResubmitForm(item, type) {
+  const limit = type === "question" ? 80 : 160;
+  return `
+    <form class="resubmit-form" data-form="resubmit" data-type="${type}" data-id="${item.id}">
+      <label for="resubmit-${type}-${item.id}">修改内容</label>
+      <textarea id="resubmit-${type}-${item.id}" class="text-area" name="body" maxlength="${limit}" ${type === "question" ? 'minlength="5"' : ""} required>${escapeHtml(item.body)}</textarea>
+      <label class="switch-label">
+        <input name="anonymous" type="checkbox"${item.anonymous !== false ? " checked" : ""} />
+        匿名显示
+      </label>
+      <div class="resubmit-actions">
+        <button class="button button-ghost" type="button" data-action="cancel-resubmit">取消</button>
+        <button class="button button-primary" type="submit"${submissionsAreDisabled() ? " disabled" : ""}>${icon("send")} 重新提交</button>
+      </div>
+    </form>
+  `;
 }
 
 function contentRow(title, meta, status) {
@@ -1078,11 +1700,221 @@ function statusLabel(status) {
     pending: ["status-pending", "审核中"],
     open: ["status-published", "等待回答"],
     published: ["status-published", "已发布"],
-    rejected: ["", "需要修改"],
-    hidden: ["", "已隐藏"],
+    rejected: ["status-rejected", "需要修改"],
+    hidden: ["status-hidden", "已隐藏"],
+    closed: ["status-hidden", "已关闭"],
   };
   const [className, label] = map[status] || ["", status];
   return `<span class="status-label ${className}">${label}</span>`;
+}
+
+function findStoredSubmission(type, id) {
+  const list = type === "question" ? persisted.myQuestions : persisted.myAnswers;
+  return list.find((item) => item.id === id) || null;
+}
+
+function applySubmissionStatus(result, receipt) {
+  const type = result.type === "answer" ? "answer" : "question";
+  const list = type === "question" ? persisted.myQuestions : persisted.myAnswers;
+  let item = list.find((entry) => entry.id === result.id || entry.receipt === receipt);
+  const latestEvent = Array.isArray(result.events) ? result.events[0] : null;
+
+  if (!item) {
+    if (type === "question") {
+      item = {
+        id: result.id,
+        body: result.body,
+        direction: result.direction,
+        askerRole: result.authorRole,
+        targetRole: result.targetRole,
+        answerCount: 0,
+        authorSessionId: sessionId,
+      };
+    } else {
+      item = {
+        id: result.id,
+        questionId: result.questionId,
+        questionBody: result.questionBody,
+        body: result.body,
+        role: result.authorRole,
+      };
+    }
+    list.unshift(item);
+  }
+
+  const knownEvents = new Set(normalizeEventIds(item.eventIds));
+  const incomingEvents = Array.isArray(result.events)
+    ? result.events.filter((event) => Number.isSafeInteger(Number(event.id)))
+    : [];
+
+  incomingEvents
+    .filter((event) => !knownEvents.has(Number(event.id)) && event.type !== "submitted")
+    .sort((a, b) => Number(a.id) - Number(b.id))
+    .forEach((event) => {
+      persisted.notifications.unshift({
+        id: `submission-${type}-${result.id}-${event.id}`,
+        title: submissionEventTitle(type, event.type),
+        detail: event.message,
+        createdAt: event.createdAt || new Date().toISOString(),
+        read: false,
+      });
+    });
+
+  Object.assign(item, {
+    id: result.id,
+    body: result.body,
+    status: result.status,
+    anonymous: result.anonymous !== false,
+    createdAt: result.createdAt || item.createdAt || new Date().toISOString(),
+    updatedAt: result.updatedAt || item.updatedAt || null,
+    receipt,
+    rejectionReason: result.rejectionReason || "",
+    revision: Math.max(1, Number(result.revision || item.revision || 1)),
+    eventIds: incomingEvents.map((event) => Number(event.id)).slice(0, 40),
+    latestEvent: latestEvent
+      ? {
+          type: latestEvent.type,
+          message: latestEvent.message,
+          createdAt: latestEvent.createdAt,
+        }
+      : item.latestEvent || null,
+  });
+
+  if (type === "question") {
+    Object.assign(item, {
+      direction: result.direction,
+      askerRole: result.authorRole,
+      targetRole: result.targetRole,
+    });
+  } else {
+    Object.assign(item, {
+      questionId: result.questionId,
+      questionBody: result.questionBody,
+      role: result.authorRole,
+    });
+  }
+
+  return { item, type };
+}
+
+function submissionEventTitle(type, eventType) {
+  const subject = type === "question" ? "问题" : "回答";
+  const labels = {
+    approved: `${subject}已通过审核`,
+    rejected: `${subject}需要修改`,
+    resubmitted: `${subject}已重新提交`,
+    hidden: `${subject}已隐藏`,
+    closed: "问题已关闭",
+    reopened: "问题已重新开放",
+    answer_received: "问题收到新回答",
+    featured: "回答被设为精选",
+    published: "回答已重新发布",
+  };
+  return labels[eventType] || `${subject}状态已更新`;
+}
+
+async function refreshSubmissionStatuses({ silent = false, renderAfter = true } = {}) {
+  if (!backend.enabled || ui.statusSyncing) return;
+  const tracked = [...persisted.myQuestions, ...persisted.myAnswers].filter((item) => item.receipt);
+  if (!tracked.length) {
+    if (!silent) showToast("还没有可以同步的线上投稿。", false, 1800);
+    return;
+  }
+
+  ui.statusSyncing = true;
+  if (renderAfter && ui.route === "mine") render();
+  const results = await Promise.allSettled(
+    tracked.map(async (item) => ({
+      receipt: item.receipt,
+      status: await backend.getSubmissionStatus(item.receipt),
+    })),
+  );
+  let updated = 0;
+  results.forEach((result) => {
+    if (result.status !== "fulfilled") return;
+    applySubmissionStatus(result.value.status, result.value.receipt);
+    updated += 1;
+  });
+  savePersistedState();
+  ui.statusSyncing = false;
+  if (renderAfter && ui.route === "mine") render();
+
+  if (!silent) {
+    const failed = results.length - updated;
+    showToast(
+      failed ? `已同步 ${updated} 条，${failed} 条暂时失败。` : `已同步 ${updated} 条投稿状态。`,
+      Boolean(failed && !updated),
+      2400,
+    );
+  }
+}
+
+async function importSubmissionReceipt(form) {
+  const receipt = normalizeReceipt(new FormData(form).get("receipt"));
+  if (!receipt) {
+    showToast("请输入完整的 64 位恢复码。", true);
+    return;
+  }
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    const result = await backend.getSubmissionStatus(receipt);
+    const restored = applySubmissionStatus(result, receipt);
+    ui.mineTab = restored.type === "question" ? "questions" : "answers";
+    savePersistedState();
+    render();
+    showToast("投稿记录已恢复到这台设备。", false, 2200);
+  } catch (error) {
+    showToast(submissionErrorMessage(error, "恢复码无效或已经过期。"), true, 2800);
+    if (button) button.disabled = false;
+  }
+}
+
+async function resubmitStoredSubmission(form) {
+  if (submissionsAreDisabled()) {
+    showToast(runtimeMessage(), true, 2600);
+    return;
+  }
+  const type = form.dataset.type === "answer" ? "answer" : "question";
+  const item = findStoredSubmission(type, form.dataset.id);
+  if (!item?.receipt) return;
+  const formData = new FormData(form);
+  const body = String(formData.get("body") || "").trim();
+  const minimum = type === "question" ? 5 : 1;
+  if (countCharacters(body) < minimum) {
+    showToast(type === "question" ? "问题至少需要 5 个字。" : "请先写下你的回答。", true);
+    return;
+  }
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    const method = type === "question" ? backend.resubmitQuestion : backend.resubmitAnswer;
+    await method({
+      receipt: item.receipt,
+      body,
+      anonymous: formData.get("anonymous") === "on",
+    });
+    const result = await backend.getSubmissionStatus(item.receipt);
+    applySubmissionStatus(result, item.receipt);
+    ui.editingSubmission = null;
+    savePersistedState();
+    render();
+    showToast("修改已重新提交审核。", false, 2200);
+  } catch (error) {
+    showToast(submissionErrorMessage(error, "重新提交失败，请稍后再试。"), true, 3000);
+    if (button) button.disabled = false;
+  }
+}
+
+function submissionErrorMessage(error, fallback) {
+  if (["submissions_paused", "read_only", "emergency_lockdown", "rate_limited", "question_not_open", "own_question", "already_answered", "not_resubmittable"].includes(error?.code)) {
+    return error.message || fallback;
+  }
+  if (error?.code === "not_found") return "恢复码无效或已经过期。";
+  if (error?.code === "22001") return "内容长度不符合要求，请检查后再试。";
+  if (error?.code === "22023") return "内容中不能包含联系方式、网址或特殊标记。";
+  if (error?.code === "23514") return "当前身份或内容状态不允许这项操作。";
+  return fallback;
 }
 
 function handleClick(event) {
@@ -1090,29 +1922,38 @@ function handleClick(event) {
   if (!target) return;
   const action = target.dataset.action;
 
-  if (action === "open-note" && performance.now() < suppressNoteClickUntil) {
+  if (performance.now() < suppressClickUntil) {
     event.preventDefault();
     return;
   }
 
-  if (action === "navigate") {
-    navigate(target.dataset.route);
-  } else if (action === "continue-browsing") {
-    ui.pendingIntent = null;
-    navigate("wall");
+  if (action === "copy-unsaved-receipt") {
+    void copyUnsavedReceipt();
+  } else if (action === "acknowledge-unsaved-receipt") {
+    acknowledgeUnsavedReceipt();
+  } else if (action === "navigate") {
+    const route = target.dataset.route;
+    if (route === "participate" && !persisted.role) {
+      requestIdentity({ type: "navigate", route: "participate" });
+    } else {
+      navigate(route);
+    }
+  } else if (action === "go-back") {
+    goBack(target.dataset.fallbackRoute || "wall");
   } else if (action === "landing-ask") {
     startAsk();
   } else if (action === "landing-answer") {
     startAnswer();
   } else if (action === "landing-browse") {
-    navigate("discover");
+    navigate("wall");
   } else if (action === "wall-prev") {
     moveWall(-1);
   } else if (action === "wall-next") {
     moveWall(1);
   } else if (action === "choose-role") {
-    ui.pendingIntent = null;
-    navigate("identity");
+    if (ui.route !== "identity") {
+      requestIdentity({ type: "return", route: ui.route });
+    }
   } else if (action === "select-role") {
     selectRole(target.dataset.role);
   } else if (action === "start-ask") {
@@ -1132,27 +1973,112 @@ function handleClick(event) {
     saveAnswerDraft(target.dataset.questionId);
   } else if (action === "mine-tab") {
     ui.mineTab = target.dataset.value;
+    ui.editingSubmission = null;
     render();
+  } else if (action === "sync-submissions") {
+    void refreshSubmissionStatuses();
+  } else if (action === "edit-submission") {
+    ui.editingSubmission = {
+      type: target.dataset.type === "answer" ? "answer" : "question",
+      id: target.dataset.id,
+    };
+    render();
+  } else if (action === "cancel-resubmit") {
+    ui.editingSubmission = null;
+    render();
+  } else if (action === "copy-receipt") {
+    void copySubmissionReceipt(target.dataset.type, target.dataset.id);
   }
+}
+
+async function copySubmissionReceipt(type, id) {
+  const item = findStoredSubmission(type === "answer" ? "answer" : "question", id);
+  if (!item?.receipt) return;
+  try {
+    await navigator.clipboard.writeText(item.receipt);
+    showToast("恢复码已复制。", false, 1600);
+  } catch {
+    showToast("暂时无法复制，请长按恢复码手动选择。", true, 2400);
+  }
+}
+
+async function copyUnsavedReceipt() {
+  const receipt = normalizeReceipt(ui.receiptFallback?.receipt);
+  if (!receipt) return;
+  try {
+    await navigator.clipboard.writeText(receipt);
+    showToast("恢复码已复制，请保存到安全位置。", false, 2200);
+  } catch {
+    const code = document.getElementById("unsaved-receipt-code");
+    if (code) {
+      code.focus();
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(code);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch {
+        // The code remains visible and user-selectable when programmatic selection is unavailable.
+      }
+    }
+    showToast("无法自动复制，请长按恢复码手动选择。", true, 3200);
+  }
+}
+
+function acknowledgeUnsavedReceipt() {
+  const fallback = ui.receiptFallback;
+  if (!fallback) return;
+  const confirmation = document.getElementById("receipt-saved-confirmation");
+  if (!confirmation?.checked) {
+    showToast("请先保存恢复码并勾选确认。", true, 2600);
+    return;
+  }
+
+  try {
+    ensureSubmissionInMemory(fallback.type, fallback.submission);
+  } catch {
+    // The externally saved receipt remains the authoritative recovery path.
+  }
+  const storedLocally = persistSubmissionReceipt(fallback.type, fallback.submission);
+  clearPendingReceiptFallback();
+  ui.receiptFallback = null;
+  ui.mineTab = fallback.type === "answer" ? "answers" : "questions";
+  navigate("mine");
+  showToast(
+    storedLocally ? "恢复码已保存到这台设备。" : "投稿已成功，请继续妥善保管恢复码。",
+    false,
+    3200,
+  );
 }
 
 function moveWall(delta) {
   if (delta < 0) {
-    if (ui.recommendationIndex <= 0) return;
-    ui.recommendationIndex -= 1;
+    if (ui.recommendationComplete) {
+      if (!ui.recommendationIds.length) return;
+      ui.recommendationComplete = false;
+      ui.recommendationIndex = ui.recommendationIds.length - 1;
+    } else {
+      if (ui.recommendationIndex <= 0) {
+        showToast("已经是第一张便签了。", false, 1400);
+        return;
+      }
+      ui.recommendationIndex -= 1;
+    }
     ui.feedMotion = "previous";
   } else {
+    if (ui.recommendationComplete) return;
     if (ui.recommendationIndex < ui.recommendationIds.length - 1) {
       ui.recommendationIndex += 1;
     } else {
       const next = peekNextRecommendation();
       if (!next) {
-        showToast("这一批便签已经看完了。", false, 1800);
-        return;
+        ui.recommendationComplete = true;
+      } else {
+        ui.recommendationIds.push(next.id);
+        ui.recommendationIndex += 1;
+        rememberSeenNote(next.id);
       }
-      ui.recommendationIds.push(next.id);
-      ui.recommendationIndex += 1;
-      rememberSeenNote(next.id);
     }
     ui.feedMotion = "next";
   }
@@ -1162,7 +2088,7 @@ function moveWall(delta) {
 }
 
 function handleKeydown(event) {
-  if (ui.route !== "wall" && ui.route !== "discover") return;
+  if (ui.route !== "wall") return;
   if (dialog.open || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(document.activeElement?.tagName)) return;
   if (event.key === "ArrowUp") {
     event.preventDefault();
@@ -1180,19 +2106,19 @@ function handleTouchStart(event) {
 
   const target = event.target;
   if (ui.route === "home") {
-    if (target.closest("button, a, input, textarea, select")) return;
+    if (!target.closest(".landing-page") || target.closest(".landing-action")) return;
     const touch = event.touches[0];
     touchGestureStart = {
       kind: "landing",
       x: touch.clientX,
       y: touch.clientY,
       axis: null,
-      moved: false,
+      startedAt: performance.now(),
     };
     return;
   }
 
-  if ((ui.route !== "wall" && ui.route !== "discover") || !target.closest(".single-note-stage")) {
+  if (ui.route !== "wall" || !target.closest(".recommendation-page")) {
     return;
   }
 
@@ -1202,7 +2128,7 @@ function handleTouchStart(event) {
     x: touch.clientX,
     y: touch.clientY,
     axis: null,
-    moved: false,
+    startedAt: performance.now(),
   };
 }
 
@@ -1212,13 +2138,12 @@ function handleTouchMove(event) {
   const dx = touch.clientX - touchGestureStart.x;
   const dy = touch.clientY - touchGestureStart.y;
 
-  if (!touchGestureStart.axis && Math.max(Math.abs(dx), Math.abs(dy)) > 10) {
-    if (Math.abs(dy) > Math.abs(dx) * 1.2) touchGestureStart.axis = "y";
-    if (Math.abs(dx) > Math.abs(dy) * 1.2) touchGestureStart.axis = "x";
+  if (!touchGestureStart.axis && Math.max(Math.abs(dx), Math.abs(dy)) > 8) {
+    if (Math.abs(dy) > Math.abs(dx) * 1.05) touchGestureStart.axis = "y";
+    if (Math.abs(dx) > Math.abs(dy) * 1.35) touchGestureStart.axis = "x";
   }
-  if (Math.hypot(dx, dy) > 10) touchGestureStart.moved = true;
 
-  if (touchGestureStart.kind === "viewer" && touchGestureStart.axis === "y") {
+  if (touchGestureStart.axis === "y" && event.cancelable) {
     event.preventDefault();
   }
 }
@@ -1237,24 +2162,29 @@ function handleTouchEnd(event) {
   const dy = touch.clientY - start.y;
   const horizontalDistance = Math.abs(dx);
   const verticalDistance = Math.abs(dy);
+  const elapsed = Math.max(1, performance.now() - start.startedAt);
+  const hasVerticalIntent = verticalDistance > horizontalDistance * 1.05;
+  const hasSwipeDistance = verticalDistance >= 48;
+  const isFastVerticalFlick = verticalDistance >= 28 && verticalDistance / elapsed >= 0.32;
+  const verticalSwipe = hasVerticalIntent && (hasSwipeDistance || isFastVerticalFlick);
 
   if (start.kind === "landing") {
-    if (dy < -56 && verticalDistance > horizontalDistance * 1.15) {
-      event.preventDefault();
-      navigate("discover");
+    if (dy < 0 && verticalSwipe) {
+      if (event.cancelable) event.preventDefault();
+      suppressClickUntil = performance.now() + 450;
+      navigate("wall");
     }
     return;
   }
 
-  if (ui.route !== "wall" && ui.route !== "discover") return;
-  if (start.moved) suppressNoteClickUntil = performance.now() + 450;
-  const verticalSwipe =
-    (start.axis === "y" || start.axis === null) &&
-    verticalDistance >= 52 &&
-    verticalDistance > horizontalDistance * 1.2;
+  if (ui.route !== "wall") return;
+  if (!verticalSwipe && horizontalDistance >= 48) {
+    suppressClickUntil = performance.now() + 300;
+  }
   if (!verticalSwipe) return;
 
-  event.preventDefault();
+  if (event.cancelable) event.preventDefault();
+  suppressClickUntil = performance.now() + 450;
   moveWall(dy < 0 ? 1 : -1);
 }
 
@@ -1285,8 +2215,10 @@ function handleSubmit(event) {
   if (!form) return;
   event.preventDefault();
 
-  if (form.dataset.form === "ask") submitQuestion(form);
-  if (form.dataset.form === "answer") submitAnswer(form);
+  if (form.dataset.form === "ask") void submitQuestion(form);
+  if (form.dataset.form === "answer") void submitAnswer(form);
+  if (form.dataset.form === "import-receipt") void importSubmissionReceipt(form);
+  if (form.dataset.form === "resubmit") void resubmitStoredSubmission(form);
 }
 
 function selectRole(role) {
@@ -1304,7 +2236,7 @@ function selectRole(role) {
   const intent = ui.pendingIntent;
   ui.pendingIntent = null;
   if (intent?.type === "ask") {
-    navigate("ask");
+    navigate("ask", { replace: true });
     return;
   }
 
@@ -1312,16 +2244,35 @@ function selectRole(role) {
     const question = findQuestion(intent.questionId);
     if (question?.targetRole === role) {
       ui.selectedQuestionId = question.id;
-      navigate("answer");
+      navigate("answer", { replace: true });
     } else {
-      showToast(`这道题在等${roleName(question?.targetRole)}回答，已为你打开适合的问题池。`);
-      navigate("pool");
+      if (question) {
+        showToast(`这道题在等${roleName(question.targetRole)}回答，已为你打开适合的问题池。`);
+      } else {
+        showToast("原问题已经不可用，已为你打开问题池。", true);
+      }
+      navigate("pool", { replace: true });
     }
     return;
   }
 
   if (intent?.type === "answer") {
-    navigate("pool");
+    navigate("pool", { replace: true });
+    return;
+  }
+
+  if (intent?.type === "return") {
+    const returnRoute = normalizeRoleReturnRoute(intent.route, role);
+    if (returnRoute === "pool" && intent.route === "answer") {
+      navigate("pool", { replace: true });
+    } else {
+      goBack(returnRoute);
+    }
+    return;
+  }
+
+  if (intent?.type === "navigate") {
+    navigate(intent.route, { replace: true });
     return;
   }
 
@@ -1340,28 +2291,50 @@ function selectRole(role) {
     return;
   }
 
-  navigate("participate");
+  navigate("participate", { replace: true });
+}
+
+function normalizeRoleReturnRoute(route, role) {
+  const normalized = normalizeRoute(route);
+  if (normalized !== "answer") return normalized;
+  const question = findQuestion(ui.selectedQuestionId);
+  return question?.targetRole === role ? "answer" : "pool";
+}
+
+function requestIdentity(intent) {
+  ui.pendingIntent = intent;
+  navigate("identity", { preserveIntent: true });
 }
 
 function startAsk() {
+  if (submissionsAreDisabled()) {
+    showToast(runtimeMessage(), true, 2600);
+    return;
+  }
   if (!persisted.role) {
-    ui.pendingIntent = { type: "ask" };
-    navigate("identity");
+    requestIdentity({ type: "ask" });
     return;
   }
   navigate("ask");
 }
 
 function startAnswer() {
+  if (submissionsAreDisabled()) {
+    showToast(runtimeMessage(), true, 2600);
+    return;
+  }
   if (!persisted.role) {
-    ui.pendingIntent = { type: "answer" };
-    navigate("identity");
+    requestIdentity({ type: "answer" });
     return;
   }
   navigate("pool");
 }
 
 async function submitQuestion(form) {
+  if (submissionsAreDisabled()) {
+    showToast(runtimeMessage(), true, 2600);
+    return;
+  }
   const formData = new FormData(form);
   const body = String(formData.get("body") || "").trim();
   const anonymous = formData.get("anonymous") === "on";
@@ -1385,51 +2358,68 @@ async function submitQuestion(form) {
     createdAt: new Date().toISOString(),
     authorSessionId: sessionId,
   };
+  let remoteSucceeded = false;
 
   const submitButton = form.querySelector('button[type="submit"]');
   if (backend.enabled) {
     if (submitButton) submitButton.disabled = true;
+    let remoteQuestion;
     try {
-      const remoteQuestion = await backend.createQuestion({
+      remoteQuestion = await backend.createQuestion({
         id: question.id,
         authorSessionId: sessionId,
         authorRole: persisted.role,
         body,
         anonymous,
       });
-      question = { ...question, ...remoteQuestion, anonymous, authorSessionId: sessionId };
     } catch (error) {
-      console.error("Unable to publish question.", error);
-      showToast("问题发布失败，草稿已经保留，请稍后重试。", true, 3200);
+      console.error("Unable to submit question.", error);
+      showToast(submissionErrorMessage(error, "问题提交失败，草稿已经保留，请稍后重试。"), true, 3200);
       if (submitButton) submitButton.disabled = false;
       return;
     }
 
-    try {
-      await refreshRemoteContent();
-    } catch (error) {
+    remoteSucceeded = true;
+    question = {
+      ...question,
+      ...remoteQuestion,
+      receipt: normalizeReceipt(remoteQuestion.receipt),
+      anonymous,
+      authorSessionId: sessionId,
+    };
+
+    void refreshRemoteContent().catch((error) => {
       console.warn("Question was published, but shared content could not be refreshed.", error);
-    }
+    });
   }
 
-  persisted.myQuestions.unshift(question);
-  persisted.notifications.unshift({
-    id: `notification-${Date.now()}`,
-    title: experienceMode ? "问题已发布" : "问题已提交审核",
-    detail: experienceMode
-      ? `问题已经进入${roleName(targetRole)}的问题池。`
-      : `审核通过后会进入${roleName(targetRole)}的问题池。`,
-    createdAt: new Date().toISOString(),
-    read: false,
+  finishSuccessfulSubmission({
+    type: "question",
+    submission: question,
+    notification: {
+      id: `notification-${Date.now()}`,
+      title: experienceMode ? "问题已发布" : "问题已提交审核",
+      detail: experienceMode
+        ? `问题已经进入${roleName(targetRole)}的问题池。`
+        : `审核通过后会进入${roleName(targetRole)}的问题池。`,
+      createdAt: new Date().toISOString(),
+      read: false,
+    },
+    clearDraft: () => {
+      persisted.drafts.ask[persisted.role] = "";
+    },
+    remoteSucceeded,
+    successMessage: experienceMode
+      ? "问题已发布，正在等待回答。"
+      : "问题已提交，审核通过后会进入问题池。",
   });
-  persisted.drafts.ask[persisted.role] = "";
-  savePersistedState();
-  ui.mineTab = "questions";
-  showToast(experienceMode ? "问题已发布，正在等待回答。" : "问题已提交，审核通过后会进入问题池。", false, 2800);
-  navigate("mine");
 }
 
 async function submitAnswer(form) {
+  if (submissionsAreDisabled()) {
+    showToast(runtimeMessage(), true, 2600);
+    return;
+  }
   const question = findQuestion(form.dataset.questionId);
   if (!question || question.status !== "open") {
     showToast("这个问题已经不能继续回答，草稿已保留。", true);
@@ -1463,12 +2453,14 @@ async function submitAnswer(form) {
     status: experienceMode ? "published" : "pending",
     createdAt: new Date().toISOString(),
   };
+  let remoteSucceeded = false;
 
   const submitButton = form.querySelector('button[type="submit"]');
   if (backend.enabled) {
     if (submitButton) submitButton.disabled = true;
+    let remoteAnswer;
     try {
-      const remoteAnswer = await backend.createAnswer({
+      remoteAnswer = await backend.createAnswer({
         id: answer.id,
         questionId: question.id,
         authorSessionId: sessionId,
@@ -1476,49 +2468,58 @@ async function submitAnswer(form) {
         body,
         anonymous,
       });
-      answer = { ...answer, ...remoteAnswer };
     } catch (error) {
-      console.error("Unable to publish answer.", error);
-      showToast("回答发布失败，草稿已经保留，请稍后重试。", true, 3200);
+      console.error("Unable to submit answer.", error);
+      showToast(submissionErrorMessage(error, "回答提交失败，草稿已经保留，请稍后重试。"), true, 3200);
       if (submitButton) submitButton.disabled = false;
       return;
     }
 
-
-    try {
-      await refreshRemoteContent();
-    } catch (error) {
+    remoteSucceeded = true;
+    answer = {
+      ...answer,
+      ...remoteAnswer,
+      receipt: normalizeReceipt(remoteAnswer.receipt),
+    };
+    void refreshRemoteContent().catch((error) => {
       console.warn("Answer was published, but shared content could not be refreshed.", error);
-    }
+    });
   }
 
-  persisted.myAnswers.unshift(answer);
-  persisted.notifications.unshift({
-    id: `notification-${Date.now()}`,
-    title: experienceMode ? "回答已发布" : "回答已提交审核",
-    detail: experienceMode ? "回答已经生成一张公开便签。" : "审核通过后会生成一张公开便签。",
-    createdAt: new Date().toISOString(),
-    read: false,
+  finishSuccessfulSubmission({
+    type: "answer",
+    submission: answer,
+    notification: {
+      id: `notification-${Date.now()}`,
+      title: experienceMode ? "回答已发布" : "回答已提交审核",
+      detail: experienceMode ? "回答已经生成一张公开便签。" : "审核通过后会生成一张公开便签。",
+      createdAt: new Date().toISOString(),
+      read: false,
+    },
+    clearDraft: () => {
+      delete persisted.drafts.answer[question.id];
+    },
+    remoteSucceeded,
+    successMessage: experienceMode
+      ? "回答已发布，已经贴到问答墙。"
+      : "回答已提交，审核通过后会贴到问答墙。",
   });
-  delete persisted.drafts.answer[question.id];
-  savePersistedState();
-  ui.mineTab = "answers";
-  showToast(experienceMode ? "回答已发布，已经贴到问答墙。" : "回答已提交，审核通过后会贴到问答墙。", false, 2800);
-  navigate("mine");
 }
 
 function beginAnswerQuestion(questionId) {
+  if (submissionsAreDisabled()) {
+    showToast(runtimeMessage(), true, 2600);
+    return;
+  }
   const question = findQuestion(questionId);
   if (!question) return;
   if (!persisted.role) {
-    ui.pendingIntent = { type: "answer", questionId };
-    navigate("identity");
+    requestIdentity({ type: "answer", questionId });
     return;
   }
   if (question.targetRole !== persisted.role) {
-    ui.pendingIntent = { type: "answer", questionId };
     showToast(`这道题在等${roleName(question.targetRole)}回答，请先切换身份。`);
-    navigate("identity");
+    requestIdentity({ type: "answer", questionId });
     return;
   }
   if (question.authorSessionId === sessionId) {
@@ -1561,7 +2562,7 @@ function saveAnswerDraft(questionId) {
   showToast("草稿已保存。", false, 1600);
 }
 
-function openNote(noteId) {
+function openNote(noteId, { fromHistory = false } = {}) {
   const notes = getAvailableNotes();
   const note = notes.find((item) => item.id === noteId);
   if (!note) return;
@@ -1624,6 +2625,25 @@ function openNote(noteId) {
   dialog.scrollTop = 0;
   if (!dialog.open) dialog.showModal();
   dialog.scrollTop = 0;
+
+  const activeOverlayNoteId = getNavigationSnapshot()?.overlayNoteId;
+  if (!fromHistory && activeOverlayNoteId !== noteId) {
+    navigationDepth += 1;
+    window.history.pushState(createNavigationState({ overlayNoteId: noteId }), "", `#${ui.route}`);
+  }
+}
+
+function closeNoteDialog() {
+  if (getNavigationSnapshot()?.overlayNoteId && navigationDepth > 0) {
+    window.history.back();
+  } else if (dialog.open) {
+    dialog.close();
+  }
+}
+
+function handleDialogCancel(event) {
+  event.preventDefault();
+  closeNoteDialog();
 }
 
 function handleDialogClick(event) {
@@ -1632,13 +2652,13 @@ function handleDialogClick(event) {
     const rect = dialog.getBoundingClientRect();
     const outside =
       event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
-    if (outside) dialog.close();
+    if (outside) closeNoteDialog();
     return;
   }
 
   const action = target.dataset.dialogAction;
   if (action === "close") {
-    dialog.close();
+    closeNoteDialog();
   } else if (action === "answer") {
     const questionId = target.dataset.questionId;
     dialog.close();
@@ -1656,17 +2676,21 @@ function handleDialogClick(event) {
 }
 
 async function submitReport(noteId) {
+  if (reportsAreDisabled()) {
+    showToast(runtimeMessage("当前暂时不能提交举报。"), true, 2600);
+    return;
+  }
   if (backend.enabled) {
     try {
       await backend.createReport({ noteId, reporterSessionId: sessionId });
     } catch (error) {
       console.error("Unable to submit report.", error);
-      showToast("举报提交失败，请稍后重试。", true, 2600);
+      showToast(submissionErrorMessage(error, "举报提交失败，请稍后重试。"), true, 2600);
       return;
     }
   }
   showToast("举报已提交，我们会尽快处理。", false, 2400);
-  dialog.close();
+  closeNoteDialog();
 }
 
 function toggleFavorite(noteId) {
@@ -1706,11 +2730,11 @@ function updatePreview(type, value) {
 function showToast(message, isError = false, duration = 2200) {
   window.clearTimeout(toastTimer);
   toast.textContent = message;
-  toast.style.background = isError ? "#8f2922" : "";
+  toast.classList.toggle("is-error", isError);
   toast.classList.add("is-visible");
   toastTimer = window.setTimeout(() => {
     toast.classList.remove("is-visible");
-    toast.style.background = "";
+    toast.classList.remove("is-error");
   }, duration);
 }
 

@@ -4,19 +4,20 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https://*.supabase.co; object-src 'none'; base-uri 'self'; form-action 'self'"
+    />
+    <meta
       name="description"
       content="大人和小朋友持续互相提问、回答和自由阅读的线上便利贴问答墙。"
     />
     <title>问问墙</title>
     <link rel="preload" href="assets/note-wall-background.jpg" as="image" fetchpriority="high" />
-    <link rel="stylesheet" href="styles.css?v=11" />
-    <script
-      defer
-      src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"
-    ></script>
-    <script defer src="config.js?v=2"></script>
-    <script defer src="backend.js?v=2"></script>
-    <script defer src="app.js?v=11"></script>
+    <link rel="stylesheet" href="styles.css?v=15" />
+    <script defer src="vendor/lucide.min.js?v=1.8.0"></script>
+    <script defer src="config.js?v=3"></script>
+    <script defer src="backend.js?v=3"></script>
+    <script defer src="app.js?v=14"></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">跳到主要内容</a>

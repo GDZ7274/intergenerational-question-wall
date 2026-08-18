@@ -37,9 +37,13 @@ jobs:
           node --check prototype/app.js
           node --check prototype/backend.js
           node --check prototype/admin.js
+          node --test tests/*.test.mjs
           test -f prototype/admin.html
           test -f prototype/admin.css
           test -f prototype/assets/note-wall-background.jpg
+          test -f prototype/vendor/lucide.min.js
+          test -f supabase/migrations/0003_operational_controls.sql
+          test -f supabase/migrations/0004_release_hardening.sql
 
       - name: Prepare site and runtime configuration
         shell: bash
@@ -89,8 +93,12 @@ jobs:
           export MODERATION_STATUS
           node <<'NODE'
           const status = JSON.parse(process.env.MODERATION_STATUS || "null");
-          if (status?.schemaVersion !== 2 || status?.submissionsRequireReview !== true) {
-            throw new Error("Supabase moderation migration is missing or incompatible.");
+          if (
+            status?.schemaVersion !== 3 ||
+            status?.hardeningVersion !== 1 ||
+            status?.submissionsRequireReview !== true
+          ) {
+            throw new Error("Supabase moderation/hardening migration is missing or incompatible.");
           }
           NODE
 
