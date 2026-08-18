@@ -1,0 +1,81 @@
+name: Deploy prototype to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+      EXPERIENCE_MODE: ${{ vars.EXPERIENCE_MODE }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Prepare site and runtime configuration
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
+          const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY || "").trim();
+          const experienceModeValue = (process.env.EXPERIENCE_MODE || "true").trim().toLowerCase();
+
+          if (!supabaseUrl || !supabaseAnonKey) {
+            throw new Error("Set SUPABASE_URL and SUPABASE_ANON_KEY in the repository Actions variables before deploying.");
+          }
+
+          const parsedUrl = new URL(supabaseUrl);
+          if (parsedUrl.protocol !== "https:") {
+            throw new Error("SUPABASE_URL must use HTTPS.");
+          }
+
+          if (!new Set(["true", "false"]).has(experienceModeValue)) {
+            throw new Error("EXPERIENCE_MODE must be true or false.");
+          }
+
+          fs.rmSync("_site", { recursive: true, force: true });
+          fs.cpSync("prototype", "_site", { recursive: true });
+          fs.writeFileSync(
+            "_site/config.js",
+            `window.QUESTION_WALL_CONFIG = Object.freeze(${JSON.stringify(
+              {
+                supabaseUrl,
+                supabaseAnonKey,
+                experienceMode: experienceModeValue === "true",
+              },
+              null,
+              2,
+            )});\n`,
+          );
+          NODE
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
