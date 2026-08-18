@@ -24,13 +24,22 @@ jobs:
     env:
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
-      EXPERIENCE_MODE: ${{ vars.EXPERIENCE_MODE }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
+
+      - name: Validate static application
+        shell: bash
+        run: |
+          node --check prototype/app.js
+          node --check prototype/backend.js
+          node --check prototype/admin.js
+          test -f prototype/admin.html
+          test -f prototype/admin.css
+          test -f prototype/assets/note-wall-background.jpg
 
       - name: Prepare site and runtime configuration
         shell: bash
@@ -40,19 +49,13 @@ jobs:
 
           const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/$/, "");
           const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY || "").trim();
-          const experienceModeValue = (process.env.EXPERIENCE_MODE || "true").trim().toLowerCase();
-
           if (!supabaseUrl || !supabaseAnonKey) {
             throw new Error("Set SUPABASE_URL and SUPABASE_ANON_KEY in the repository Actions variables before deploying.");
           }
 
           const parsedUrl = new URL(supabaseUrl);
-          if (parsedUrl.protocol !== "https:") {
-            throw new Error("SUPABASE_URL must use HTTPS.");
-          }
-
-          if (!new Set(["true", "false"]).has(experienceModeValue)) {
-            throw new Error("EXPERIENCE_MODE must be true or false.");
+          if (parsedUrl.protocol !== "https:" || !parsedUrl.hostname.endsWith(".supabase.co")) {
+            throw new Error("SUPABASE_URL must be an HTTPS hosted Supabase project URL.");
           }
 
           fs.rmSync("_site", { recursive: true, force: true });
@@ -63,12 +66,32 @@ jobs:
               {
                 supabaseUrl,
                 supabaseAnonKey,
-                experienceMode: experienceModeValue === "true",
+                experienceMode: false,
               },
               null,
               2,
             )});\n`,
           );
+          NODE
+
+      - name: Verify moderation schema
+        shell: bash
+        run: |
+          MODERATION_STATUS="$(
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "apikey: ${SUPABASE_ANON_KEY}" \
+              --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+              --header "Content-Type: application/json" \
+              --data '{}' \
+              "${SUPABASE_URL}/rest/v1/rpc/moderation_status"
+          )"
+          export MODERATION_STATUS
+          node <<'NODE'
+          const status = JSON.parse(process.env.MODERATION_STATUS || "null");
+          if (status?.schemaVersion !== 2 || status?.submissionsRequireReview !== true) {
+            throw new Error("Supabase moderation migration is missing or incompatible.");
+          }
           NODE
 
       - name: Upload site

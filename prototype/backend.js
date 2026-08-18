@@ -91,7 +91,7 @@
       body,
       answerCount: 0,
       createdAt: new Date().toISOString(),
-      status: "open",
+      status: "pending",
       authorSessionId,
     };
   }
@@ -112,7 +112,7 @@
     return {
       id,
       questionId,
-      status: "published",
+      status: "pending",
       createdAt: new Date().toISOString(),
     };
   }
@@ -132,7 +132,7 @@
 
   globalThis.QuestionWallBackend = Object.freeze({
     enabled,
-    experienceMode: config.experienceMode !== false,
+    experienceMode: false,
     loadContent,
     createQuestion,
     createAnswer,
