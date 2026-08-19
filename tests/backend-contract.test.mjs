@@ -89,6 +89,55 @@ test("runtime state is normalized for the public application", async () => {
   });
 });
 
+test("shared notes are resolved through the public wall view", async () => {
+  const { backend, calls } = loadBackend([
+    jsonResponse([
+      {
+        note_id: "note-01",
+        question_id: "question-01",
+        answer_id: "answer-01",
+        direction: "adult_to_child",
+        question: "可以分享这张便签吗？",
+        answer: "可以，链接会定位到这张公开便签。",
+        published_at: "2026-08-19T01:00:00Z",
+        featured: false,
+        answer_count: 1,
+      },
+    ]),
+  ]);
+
+  const note = await backend.loadNote("note-01");
+
+  assert.equal(note.id, "note-01");
+  assert.equal(note.questionId, "question-01");
+  assert.match(calls[0].url, /wall_notes\?select=\*&note_id=eq\.note-01&limit=1$/);
+  assert.equal(await backend.loadNote("../private"), null);
+  assert.equal(calls.length, 1);
+});
+
+test("saved note ids are batch-validated through the public wall view", async () => {
+  const { backend, calls } = loadBackend([
+    jsonResponse([
+      {
+        note_id: "note-01",
+        question_id: "question-01",
+        answer_id: "answer-01",
+        direction: "adult_to_child",
+        question: "批量验证收藏吗？",
+        answer: "只返回仍然公开的便签。",
+        published_at: "2026-08-19T01:00:00Z",
+        featured: false,
+        answer_count: 1,
+      },
+    ]),
+  ]);
+
+  const notes = await backend.loadNotes(["note-01", "note-02", "../private", "note-01"]);
+
+  assert.deepEqual(JSON.parse(JSON.stringify(notes.map((note) => note.id))), ["note-01"]);
+  assert.match(calls[0].url, /wall_notes\?select=\*&note_id=in\.\(note-01,note-02\)&limit=2$/);
+});
+
 test("controlled RPC refusals expose stable error metadata", async () => {
   const { backend } = loadBackend([
     jsonResponse({

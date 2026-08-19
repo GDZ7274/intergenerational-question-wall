@@ -107,6 +107,25 @@
     };
   }
 
+  async function loadNote(noteId) {
+    const id = typeof noteId === "string" ? noteId.trim() : "";
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return null;
+    const rows = await request(`wall_notes?select=*&note_id=eq.${encodeURIComponent(id)}&limit=1`);
+    return rows.length ? mapNote(rows[0]) : null;
+  }
+
+  async function loadNotes(noteIds) {
+    const ids = [...new Set(
+      (Array.isArray(noteIds) ? noteIds : [])
+        .map((noteId) => (typeof noteId === "string" ? noteId.trim() : ""))
+        .filter((noteId) => /^[A-Za-z0-9_-]{1,128}$/.test(noteId)),
+    )].slice(0, 120);
+    if (!ids.length) return [];
+    const filter = ids.map(encodeURIComponent).join(",");
+    const rows = await request(`wall_notes?select=*&note_id=in.(${filter})&limit=${ids.length}`);
+    return rows.map(mapNote);
+  }
+
   async function loadRuntimeStatus() {
     const status = await rpc("public_runtime_status");
     return {
@@ -188,6 +207,8 @@
     enabled,
     experienceMode: false,
     loadContent,
+    loadNote,
+    loadNotes,
     loadRuntimeStatus,
     createQuestion,
     createAnswer,

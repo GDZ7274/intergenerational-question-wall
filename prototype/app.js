@@ -7,6 +7,32 @@ const SEEN_NOTES_COOKIE_LIMIT = 100;
 const SWIPE_HINT_SESSION_KEY = "question-wall-swipe-hint-seen";
 const UNSAVED_RECEIPT_SESSION_KEY = "question-wall-unsaved-receipt-v1";
 const RUNTIME_POLL_INTERVAL_MS = 20_000;
+const FAVORITE_LIMIT = 120;
+const PUBLIC_NOTE_VERIFICATION_TTL_MS = RUNTIME_POLL_INTERVAL_MS;
+const NOTE_SHARE_IMAGE_CACHE_LIMIT = 4;
+const PUBLIC_NOTE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const noteTemplateImageCache = new Map();
+const noteShareImageCache = new Map();
+const noteSharePreparationPromises = new Map();
+
+const noteExportTemplates = {
+  adult_to_child: {
+    asset: "assets/note-adult-to-child.webp",
+    width: 1200,
+    height: 1197,
+    ink: "#4b2e18",
+    question: { x: 0.097, y: 0.232, width: 0.805, height: 0.27, maxFont: 46, minFont: 30 },
+    answer: { x: 0.097, y: 0.658, width: 0.455, height: 0.23, maxFont: 38, minFont: 18 },
+  },
+  child_to_adult: {
+    asset: "assets/note-child-to-adult.webp",
+    width: 1198,
+    height: 1200,
+    ink: "#173c68",
+    question: { x: 0.078, y: 0.24, width: 0.535, height: 0.295, maxFont: 45, minFont: 27 },
+    answer: { x: 0.078, y: 0.682, width: 0.842, height: 0.218, maxFont: 38, minFont: 18 },
+  },
+};
 
 const seedNotes = [
   {
@@ -179,6 +205,11 @@ let remoteNotes = [];
 let remoteQuestions = [];
 let remoteAvailable = false;
 let remoteLoadFailed = false;
+let validatedFavoriteNoteIds = new Set();
+const verifiedPublicNotes = new Map();
+const verifiedPublicNoteTimestamps = new Map();
+let nativeFileShareUnavailable = false;
+let nativeShareUnavailable = false;
 let runtimeStatus = {
   schemaVersion: 0,
   submissionsPaused: false,
@@ -189,6 +220,7 @@ let runtimeStatus = {
 
 const sessionId = getOrCreateSessionId();
 const persisted = loadPersistedState();
+syncFavoriteNoteSnapshots({ save: false });
 savePersistedState();
 const seenNoteIds = loadSeenNoteIds();
 const pendingReceiptFallback = loadPendingReceiptFallback();
@@ -235,10 +267,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   dialog.addEventListener("cancel", handleDialogCancel);
   window.addEventListener("beforeunload", handleBeforeUnload);
   prepareInitialRoute();
-  const initialOverlayNoteId = initializeNavigationHistory();
+  const initialOverlayNoteId = initializeNavigationHistory(getSharedNoteIdFromUrl());
   window.addEventListener("popstate", handlePopState);
   render();
-  if (initialOverlayNoteId) openNote(initialOverlayNoteId, { fromHistory: true });
+  if (initialOverlayNoteId && !backend.enabled) openNote(initialOverlayNoteId, { fromHistory: true });
 
   if (backend.enabled) {
     try {
@@ -249,6 +281,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     await refreshSubmissionStatuses({ silent: true, renderAfter: false });
     render();
+    if (initialOverlayNoteId) {
+      const available = await ensureSharedNoteAvailable(initialOverlayNoteId);
+      if (available) openNote(initialOverlayNoteId, { fromHistory: true });
+      else if (remoteAvailable) showToast("这张便签已不可见或链接无效。", true, 2800);
+    }
     startRuntimeStatusPolling();
   }
 });
@@ -263,6 +300,8 @@ async function refreshRemoteSnapshot({ resetRecommendations = false } = {}) {
   remoteQuestions = content.questions;
   remoteAvailable = true;
   remoteLoadFailed = false;
+  replacePublicNoteVerification(remoteNotes);
+  await reconcileRemoteFavorites();
 
   if (resetRecommendations) {
     ui.recommendationIds = [];
@@ -277,12 +316,82 @@ async function refreshRemoteContent({ resetRecommendations = false } = {}) {
   remoteQuestions = content.questions;
   remoteAvailable = true;
   remoteLoadFailed = false;
+  replacePublicNoteVerification(remoteNotes);
+  await reconcileRemoteFavorites();
 
   if (resetRecommendations) {
     ui.recommendationIds = [];
     ui.recommendationIndex = -1;
   }
   ui.recommendationComplete = false;
+}
+
+async function ensureSharedNoteAvailable(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id) return false;
+  if (!backend.enabled) return Boolean(findViewableNote(id));
+
+  const result = await verifyPublicNote(id);
+  if (result.status !== "available") return false;
+  return true;
+}
+
+async function reconcileRemoteFavorites() {
+  if (!backend.enabled) return true;
+  if (runtimeStatus.emergencyLockdown) {
+    clearPublicNoteVerification();
+    validatedFavoriteNoteIds = new Set();
+    return false;
+  }
+  const favoriteIds = [...persisted.favorites];
+  const liveNotesById = new Map(remoteNotes.map((note) => [note.id, note]));
+  validatedFavoriteNoteIds = new Set(
+    favoriteIds.filter((id) => liveNotesById.has(id)),
+  );
+  favoriteIds.forEach((id) => {
+    verifiedPublicNotes.delete(id);
+    verifiedPublicNoteTimestamps.delete(id);
+  });
+  validatedFavoriteNoteIds.forEach((id) => markPublicNoteVerified(liveNotesById.get(id)));
+
+  if (!favoriteIds.length) {
+    if (persisted.favoriteNotes.length) {
+      persisted.favoriteNotes = [];
+      savePersistedState();
+    }
+    return true;
+  }
+  if (!remoteAvailable || typeof backend.loadNotes !== "function") {
+    syncFavoriteNoteSnapshots();
+    return false;
+  }
+
+  try {
+    const publicNotes = await backend.loadNotes(favoriteIds);
+    const snapshotsById = new Map(
+      publicNotes
+        .map(createFavoriteNoteSnapshot)
+        .filter(Boolean)
+        .map((note) => [note.id, note]),
+    );
+    const nextFavoriteIds = favoriteIds.filter((id) => snapshotsById.has(id));
+    const nextSnapshots = nextFavoriteIds.map((id) => snapshotsById.get(id));
+    const changed =
+      JSON.stringify(nextFavoriteIds) !== JSON.stringify(persisted.favorites) ||
+      JSON.stringify(nextSnapshots) !== JSON.stringify(persisted.favoriteNotes);
+    persisted.favorites = nextFavoriteIds;
+    persisted.favoriteNotes = nextSnapshots;
+    validatedFavoriteNoteIds = new Set(nextFavoriteIds);
+    publicNotes.forEach((note) => {
+      if (validatedFavoriteNoteIds.has(note.id)) markPublicNoteVerified(note);
+    });
+    if (changed) savePersistedState();
+    return true;
+  } catch (error) {
+    console.warn("Unable to validate saved notes against the public wall.", error);
+    syncFavoriteNoteSnapshots();
+    return false;
+  }
 }
 
 function runtimeStatusChanged(previous, next) {
@@ -302,7 +411,44 @@ function handleRemoteUnavailable(error) {
   remoteQuestions = [];
   remoteAvailable = false;
   remoteLoadFailed = true;
+  validatedFavoriteNoteIds = new Set();
+  clearPublicNoteVerification({ clearShareImages: false });
   resetRemoteRecommendations();
+}
+
+function markPublicNoteVerified(note, verifiedAt = Date.now()) {
+  const id = normalizePublicNoteId(note?.id);
+  if (!id) return null;
+  const previous = verifiedPublicNotes.get(id);
+  if (previous && noteShareContentKey(previous) !== noteShareContentKey(note)) {
+    noteShareImageCache.delete(id);
+  }
+  verifiedPublicNotes.set(id, note);
+  verifiedPublicNoteTimestamps.set(id, verifiedAt);
+  return note;
+}
+
+function replacePublicNoteVerification(notes) {
+  verifiedPublicNotes.clear();
+  verifiedPublicNoteTimestamps.clear();
+  (Array.isArray(notes) ? notes : []).forEach((note) => markPublicNoteVerified(note));
+}
+
+function clearPublicNoteVerification({ clearShareImages = true } = {}) {
+  verifiedPublicNotes.clear();
+  verifiedPublicNoteTimestamps.clear();
+  if (clearShareImages) noteShareImageCache.clear();
+}
+
+function getFreshVerifiedPublicNote(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id || runtimeStatus.emergencyLockdown) return null;
+  if (backend.enabled && !remoteAvailable) return null;
+  const note = verifiedPublicNotes.get(id);
+  const verifiedAt = verifiedPublicNoteTimestamps.get(id);
+  if (!note || !Number.isFinite(verifiedAt)) return null;
+  if (Date.now() - verifiedAt > PUBLIC_NOTE_VERIFICATION_TTL_MS) return null;
+  return note;
 }
 
 async function syncRuntimeStatus() {
@@ -321,6 +467,8 @@ async function syncRuntimeStatus() {
         remoteQuestions = [];
         remoteAvailable = true;
         remoteLoadFailed = false;
+        validatedFavoriteNoteIds = new Set();
+        clearPublicNoteVerification();
         resetRemoteRecommendations();
       } else if (needsContentRefresh) {
         await refreshRemoteContent({ resetRecommendations: previous.emergencyLockdown });
@@ -406,6 +554,7 @@ function loadPersistedState() {
   const fallback = {
     role: null,
     favorites: [],
+    favoriteNotes: [],
     myQuestions: [],
     myAnswers: [],
     notifications: [
@@ -438,6 +587,12 @@ function loadPersistedState() {
           };
     const myQuestions = normalizeStoredQuestions(parsed.myQuestions);
     const myAnswers = normalizeStoredAnswers(parsed.myAnswers);
+    const favorites = Array.isArray(parsed.favorites)
+      ? [...new Set(parsed.favorites.map(normalizePublicNoteId).filter(Boolean))].slice(-FAVORITE_LIMIT)
+      : fallback.favorites;
+    const favoriteNotesById = new Map(
+      normalizeFavoriteNotes(parsed.favoriteNotes).map((note) => [note.id, note]),
+    );
     const answerDrafts =
       parsedDrafts.answer && typeof parsedDrafts.answer === "object" && !Array.isArray(parsedDrafts.answer)
         ? Object.fromEntries(Object.entries(parsedDrafts.answer).filter(([, value]) => typeof value === "string"))
@@ -445,9 +600,8 @@ function loadPersistedState() {
 
     return {
       role,
-      favorites: Array.isArray(parsed.favorites)
-        ? parsed.favorites.filter((id) => typeof id === "string")
-        : fallback.favorites,
+      favorites,
+      favoriteNotes: favorites.map((id) => favoriteNotesById.get(id)).filter(Boolean),
       myQuestions,
       myAnswers,
       notifications: Array.isArray(parsed.notifications) ? parsed.notifications : fallback.notifications,
@@ -459,6 +613,62 @@ function loadPersistedState() {
   } catch {
     return fallback;
   }
+}
+
+function normalizePublicNoteId(value) {
+  const id = typeof value === "string" ? value.trim() : "";
+  return PUBLIC_NOTE_ID_PATTERN.test(id) ? id : "";
+}
+
+function normalizeFavoriteNotes(value) {
+  if (!Array.isArray(value)) return [];
+  const notesById = new Map();
+  value.forEach((note) => {
+    const normalized = createFavoriteNoteSnapshot(note);
+    if (!normalized) return;
+    notesById.delete(normalized.id);
+    notesById.set(normalized.id, normalized);
+  });
+  return [...notesById.values()].slice(-FAVORITE_LIMIT);
+}
+
+function createFavoriteNoteSnapshot(note) {
+  if (!note || typeof note !== "object") return null;
+  const id = normalizePublicNoteId(note.id);
+  const questionId = normalizePublicNoteId(note.questionId);
+  const answerId = normalizePublicNoteId(note.answerId);
+  const direction = ["adult_to_child", "child_to_adult"].includes(note.direction) ? note.direction : "";
+  const question = truncateNoteText(note.question, 80);
+  const answer = truncateNoteText(note.answer, 160);
+  if (!id || !questionId || !answerId || !direction || !question || !answer) return null;
+  return {
+    id,
+    questionId,
+    answerId,
+    direction,
+    question,
+    answer,
+    createdAt: typeof note.createdAt === "string" ? note.createdAt : new Date().toISOString(),
+    featured: Boolean(note.featured),
+    answerCount: Math.max(1, Math.min(9999, Number(note.answerCount) || 1)),
+  };
+}
+
+function truncateNoteText(value, limit) {
+  if (typeof value !== "string") return "";
+  return splitGraphemes(value.trim()).slice(0, limit).join("");
+}
+
+function syncFavoriteNoteSnapshots({ save = true } = {}) {
+  const liveNotesById = new Map(getAvailableNotes().map((note) => [note.id, note]));
+  const storedNotesById = new Map((persisted.favoriteNotes || []).map((note) => [note.id, note]));
+  const nextSnapshots = persisted.favorites
+    .map((id) => createFavoriteNoteSnapshot(liveNotesById.get(id) || storedNotesById.get(id)))
+    .filter(Boolean);
+  const changed = JSON.stringify(nextSnapshots) !== JSON.stringify(persisted.favoriteNotes || []);
+  persisted.favoriteNotes = nextSnapshots;
+  if (changed && save) savePersistedState();
+  return changed;
 }
 
 function normalizeStoredQuestions(value) {
@@ -737,6 +947,14 @@ function getRouteFromHash() {
   return normalizeRoute(route);
 }
 
+function getSharedNoteIdFromUrl() {
+  try {
+    return normalizePublicNoteId(new URL(window.location.href).searchParams.get("note"));
+  } catch {
+    return "";
+  }
+}
+
 function prepareInitialRoute() {
   if (persisted.role) return;
 
@@ -768,7 +986,7 @@ function createNavigationState({ overlayNoteId = null } = {}) {
   };
 }
 
-function initializeNavigationHistory() {
+function initializeNavigationHistory(initialOverlayNoteId = "") {
   const snapshot = getNavigationSnapshot();
   if (Number.isInteger(snapshot?.depth) && snapshot.depth >= 0) {
     navigationDepth = snapshot.depth;
@@ -777,7 +995,8 @@ function initializeNavigationHistory() {
     ui.selectedQuestionId = snapshot.selectedQuestionId;
   }
 
-  const overlayNoteId = typeof snapshot?.overlayNoteId === "string" ? snapshot.overlayNoteId : null;
+  const overlayNoteId =
+    normalizePublicNoteId(initialOverlayNoteId) || normalizePublicNoteId(snapshot?.overlayNoteId) || null;
   window.history.replaceState(createNavigationState({ overlayNoteId }), "", `#${ui.route}`);
   return overlayNoteId;
 }
@@ -846,6 +1065,13 @@ function render() {
   `;
   ui.feedMotion = "idle";
   refreshIcons();
+  prewarmCurrentFeedNote();
+}
+
+function prewarmCurrentFeedNote() {
+  if (ui.route !== "wall" || ui.recommendationComplete) return;
+  const id = ui.recommendationIds[ui.recommendationIndex];
+  if (id) void prepareNoteForShare(id);
 }
 
 function renderReceiptFallbackPage() {
@@ -1127,7 +1353,7 @@ function renderSingleNoteViewer(note) {
           ${icon("chevron-down")}
         </button>
       </div>
-      <div class="single-note-viewer-foot">
+      <div class="single-note-viewer-foot has-note-actions">
         ${
           ui.showSwipeHint
             ? `<span class="single-note-gesture-hint">
@@ -1138,6 +1364,7 @@ function renderSingleNoteViewer(note) {
                 <span class="single-note-gesture-icon">↑</span>
               </span>`
         }
+        ${renderNoteQuickActions(note)}
       </div>
     </section>
   `;
@@ -1173,15 +1400,17 @@ function getCurrentRecommendation() {
   return next;
 }
 
-function renderNoteCard(note) {
+function renderNoteCard(note, context = "feed") {
   const direction = directionMeta(note.direction);
   const answerCount = note.answerCount || getAvailableNotes().filter((item) => item.questionId === note.questionId).length;
+  const noteContext = context === "favorite" ? ' data-note-context="favorite"' : "";
   return `
     <button
       class="note-sheet note-template ${noteTemplateClass(note.direction)}"
       type="button"
       data-action="open-note"
-      data-note-id="${note.id}"
+      data-note-id="${escapeHtml(note.id)}"
+      ${noteContext}
       aria-label="查看问答：${escapeHtml(note.question)}"
     >
       <span class="note-topline">
@@ -1195,6 +1424,36 @@ function renderNoteCard(note) {
         <span class="note-open-hint">展开 ${icon("arrow-up-right")}</span>
       </span>
     </button>
+  `;
+}
+
+function renderNoteQuickActions(note, context = "feed") {
+  const favorite = persisted.favorites.includes(note.id);
+  const contextClass = context === "saved" ? " note-quick-actions-saved" : "";
+  return `
+    <div class="note-quick-actions${contextClass}" aria-label="便签操作">
+      <button
+        class="note-quick-action"
+        type="button"
+        data-action="toggle-favorite"
+        data-note-id="${escapeHtml(note.id)}"
+        aria-label="${favorite ? "取消收藏" : "收藏这张便签"}"
+        aria-pressed="${favorite}"
+        title="${favorite ? "取消收藏" : "收藏"}"
+      >
+        ${icon(favorite ? "bookmark-check" : "bookmark")}
+      </button>
+      <button
+        class="note-quick-action"
+        type="button"
+        data-action="share-note"
+        data-note-id="${escapeHtml(note.id)}"
+        aria-label="分享这张便签"
+        title="分享"
+      >
+        ${icon("share-2")}
+      </button>
+    </div>
   `;
 }
 
@@ -1335,30 +1594,39 @@ function renderAskPage() {
         </button>
       </div>
 
-      <form id="ask-form" class="form-layout" data-form="ask">
-        <section class="form-section" aria-labelledby="ask-form-title">
-          <h2 id="ask-form-title" class="sr-only">填写问题</h2>
-          <div class="form-stack">
-            <div>
-              <div class="field-head">
-                <label class="field-name" for="ask-body">你的问题</label>
-                <span id="ask-count" class="character-count">${countCharacters(draft)} / 80</span>
-              </div>
-              <textarea id="ask-body" class="text-area" name="body" minlength="5" maxlength="80" required placeholder="写下你真正想知道的事">${escapeHtml(draft)}</textarea>
-            </div>
+      <form id="ask-form" class="composer-layout" data-form="ask">
+        <section class="composer-panel" aria-labelledby="ask-form-title">
+          <div class="composer-field-head">
+            <label id="ask-form-title" class="field-name" for="ask-body">直接写在便签上</label>
+            <span id="ask-count" class="character-count">${countCharacters(draft)} / 80</span>
+          </div>
 
+          ${renderComposerNote({
+            direction,
+            editable: "question",
+            question: draft,
+            answer: `等待${target}回答`,
+            inputId: "ask-body",
+            inputName: "body",
+            inputLabel: "你的问题",
+            placeholder: "写下你真正想知道的事",
+            minLength: 5,
+            maxLength: 80,
+          })}
+
+          <div class="composer-controls">
             <label class="switch-label" for="ask-anonymous">
               <input id="ask-anonymous" name="anonymous" type="checkbox" checked />
               匿名显示
             </label>
 
-            <div class="privacy-hint">
+            <div class="privacy-hint" id="ask-privacy-hint">
               ${icon("shield-check")}
               <span>请不要填写真实姓名、学校、电话、住址或其他联系方式。</span>
             </div>
 
             <div class="form-actions">
-              <span class="autosave-label">${icon("save")} 草稿已自动保存</span>
+              <span class="autosave-label">${icon("save")} 草稿随输入更新</span>
               <button class="button ${role === "adult" ? "button-adult" : "button-child"}" type="submit"${submissionsAreDisabled() ? " disabled" : ""}>
                 ${icon("send")}
                 ${submissionsAreDisabled() ? "暂停提交" : isExperienceMode() ? "发布问题" : "提交审核"}
@@ -1366,11 +1634,6 @@ function renderAskPage() {
             </div>
           </div>
         </section>
-
-        <details class="preview-section">
-          <summary class="preview-toggle">${icon("scan-eye")} 预览便签</summary>
-          ${renderPreviewNote({ direction, question: draft || "你的问题会出现在这里", answer: `等待${target}回答` })}
-        </details>
       </form>
     </div>
   `;
@@ -1464,35 +1727,38 @@ function renderAnswerPage() {
         </button>
       </div>
 
-      <div class="question-context">
-        <p class="question-context-label">${roleName(question.askerRole)}问</p>
-        <p class="question-context-text">${escapeHtml(question.body)}</p>
-      </div>
+      <form id="answer-form" class="composer-layout" data-form="answer" data-question-id="${escapeHtml(question.id)}">
+        <section class="composer-panel" aria-labelledby="answer-form-title">
+          <div class="composer-field-head">
+            <label id="answer-form-title" class="field-name" for="answer-body">直接写在便签上</label>
+            <span id="answer-count" class="character-count">${countCharacters(draft)} / 160</span>
+          </div>
 
-      <form id="answer-form" class="form-layout" data-form="answer" data-question-id="${question.id}">
-        <section class="form-section" aria-labelledby="answer-form-title">
-          <h2 id="answer-form-title" class="sr-only">填写回答</h2>
-          <div class="form-stack">
-            <div>
-              <div class="field-head">
-                <label class="field-name" for="answer-body">你的回答</label>
-                <span id="answer-count" class="character-count">${countCharacters(draft)} / 160</span>
-              </div>
-              <textarea id="answer-body" class="text-area" name="body" maxlength="160" required placeholder="认真说说你的想法">${escapeHtml(draft)}</textarea>
-            </div>
+          ${renderComposerNote({
+            direction: question.direction,
+            editable: "answer",
+            question: question.body,
+            answer: draft,
+            inputId: "answer-body",
+            inputName: "body",
+            inputLabel: "你的回答",
+            placeholder: "认真说说你的想法",
+            maxLength: 160,
+          })}
 
+          <div class="composer-controls">
             <label class="switch-label" for="answer-anonymous">
               <input id="answer-anonymous" name="anonymous" type="checkbox" checked />
               匿名显示
             </label>
 
-            <div class="privacy-hint">
+            <div class="privacy-hint" id="answer-privacy-hint">
               ${icon("shield-check")}
               <span>请不要填写真实姓名、学校、电话、住址或其他联系方式。</span>
             </div>
 
             <div class="form-actions">
-              <span class="autosave-label">${icon("save")} 草稿已自动保存</span>
+              <span class="autosave-label">${icon("save")} 草稿随输入更新</span>
               <button class="button ${persisted.role === "adult" ? "button-adult" : "button-child"}" type="submit"${submissionsAreDisabled() ? " disabled" : ""}>
                 ${icon("send")}
                 ${submissionsAreDisabled() ? "暂停提交" : isExperienceMode() ? "发布回答" : "提交审核"}
@@ -1500,33 +1766,77 @@ function renderAnswerPage() {
             </div>
           </div>
         </section>
-
-        <details class="preview-section">
-          <summary class="preview-toggle">${icon("scan-eye")} 预览便签</summary>
-          ${renderPreviewNote({ direction: question.direction, question: question.body, answer: draft || "你的回答会出现在这里" })}
-        </details>
       </form>
     </div>
   `;
 }
 
-function renderPreviewNote({ direction, question, answer }) {
-  const directionInfo = directionMeta(direction);
+function renderComposerNote({
+  direction,
+  editable,
+  question,
+  answer,
+  inputId,
+  inputName,
+  inputLabel,
+  placeholder,
+  minLength = 0,
+  maxLength,
+}) {
+  const questionDensity = noteTextDensity(question, "question");
+  const answerDensity = noteTextDensity(answer, "answer");
+  const inputValue = editable === "question" ? question : answer;
+  const inputDensity = editable === "question" ? questionDensity : answerDensity;
+  const fieldClass = editable === "question" ? "composer-note-question" : "composer-note-answer";
+  const describedBy = editable === "question" ? "ask-privacy-hint" : "answer-privacy-hint";
+  const input = `
+    <div class="composer-note-field ${fieldClass}">
+      <textarea
+        id="${inputId}"
+        class="composer-note-input"
+        name="${inputName}"
+        ${minLength ? `minlength="${minLength}"` : ""}
+        maxlength="${maxLength}"
+        required
+        aria-label="${inputLabel}"
+        aria-describedby="${describedBy}"
+        data-note-kind="${editable}"
+        data-note-density="${inputDensity}"
+        placeholder="${placeholder}"
+      >${escapeHtml(inputValue)}</textarea>
+    </div>
+  `;
   return `
-    <div class="note-sheet note-template ${noteTemplateClass(direction)} preview-note">
-      <span class="direction-label ${directionInfo.className}">${directionInfo.label}</span>
-      <span class="note-question" data-preview="question">${escapeHtml(question)}</span>
-      <span class="note-divider" aria-hidden="true"></span>
-      <span class="note-answer" data-preview="answer">${escapeHtml(answer)}</span>
-      <span class="note-footer">
-        <span>预览</span>
-      </span>
+    <div class="composer-note note-template ${noteTemplateClass(direction)}">
+      ${
+        editable === "question"
+          ? input
+          : `<p class="composer-note-copy composer-note-question" data-note-density="${questionDensity}">${escapeHtml(question)}</p>`
+      }
+      ${
+        editable === "answer"
+          ? input
+          : `<p class="composer-note-copy composer-note-answer composer-note-waiting" data-note-density="${answerDensity}">${escapeHtml(answer)}</p>`
+      }
     </div>
   `;
 }
 
+function noteTextDensity(value, type) {
+  const length = countCharacters(value);
+  if (type === "question") {
+    if (length > 58) return "dense";
+    if (length > 34) return "compact";
+    return "comfortable";
+  }
+  if (length > 110) return "dense";
+  if (length > 62) return "compact";
+  return "comfortable";
+}
+
 function renderMinePage() {
   const trackedCount = [...persisted.myQuestions, ...persisted.myAnswers].filter((item) => item.receipt).length;
+  const favoriteCount = getFavoriteNotes().length;
 
   return `
     <div class="page-inner">
@@ -1559,7 +1869,7 @@ function renderMinePage() {
       <div class="mine-tabs" role="tablist" aria-label="我的内容">
         ${mineTabButton("questions", "我的提问")}
         ${mineTabButton("answers", "我的回答")}
-        ${mineTabButton("favorites", "收藏")}
+        ${mineTabButton("favorites", favoriteCount ? `收藏 ${favoriteCount}` : "收藏")}
         ${mineTabButton("notifications", "消息")}
       </div>
 
@@ -1600,13 +1910,48 @@ function renderMineTabContent() {
   }
 
   if (ui.mineTab === "favorites") {
-    const favorites = getAvailableNotes().filter((note) => persisted.favorites.includes(note.id));
-    if (!favorites.length) return mineEmpty("还没有收藏", "在问答墙打开便签后可以收藏", "navigate", "去问答墙", "wall");
-    return `<div class="note-wall">${favorites.map(renderNoteCard).join("")}</div>`;
+    const favorites = getFavoriteNotes();
+    if (!favorites.length) return mineEmpty("还没有收藏", "在问答墙轻点书签，就能把喜欢的便签留在这里", "navigate", "去问答墙", "wall");
+    return `
+      <div class="favorite-note-list" aria-label="收藏的便签">
+        ${favorites.map(renderFavoriteNote).join("")}
+      </div>
+    `;
   }
 
   if (!persisted.notifications.length) return mineEmpty("暂时没有消息", "收到回答和审核结果后会出现在这里", "navigate", "去问答墙", "wall");
   return `<div class="content-list">${persisted.notifications.map((item) => contentRow(item.title, item.detail, item.read ? "published" : "pending")).join("")}</div>`;
+}
+
+function getFavoriteNotes() {
+  if (runtimeStatus.emergencyLockdown) return [];
+  const liveNotesById = new Map(getAvailableNotes().map((note) => [note.id, note]));
+  const storedNotesById = new Map((persisted.favoriteNotes || []).map((note) => [note.id, note]));
+  return [...persisted.favorites]
+    .reverse()
+    .filter((id) => !backend.enabled || validatedFavoriteNoteIds.has(id))
+    .map((id) => liveNotesById.get(id) || verifiedPublicNotes.get(id) || storedNotesById.get(id))
+    .filter(Boolean);
+}
+
+function findViewableNote(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id || runtimeStatus.emergencyLockdown) return null;
+  const liveNote = getAvailableNotes().find((note) => note.id === id);
+  if (liveNote) return liveNote;
+  const verifiedNote = verifiedPublicNotes.get(id);
+  if (verifiedNote) return verifiedNote;
+  if (backend.enabled && !validatedFavoriteNoteIds.has(id)) return null;
+  return (persisted.favoriteNotes || []).find((note) => note.id === id) || null;
+}
+
+function renderFavoriteNote(note) {
+  return `
+    <article class="favorite-note-item">
+      ${renderNoteCard(note, "favorite")}
+      ${renderNoteQuickActions(note, "saved")}
+    </article>
+  `;
 }
 
 function renderSubmissionRow(item, type) {
@@ -1960,8 +2305,17 @@ function handleClick(event) {
     startAsk();
   } else if (action === "start-answer") {
     startAnswer();
+  } else if (action === "toggle-favorite") {
+    toggleFavorite(target.dataset.noteId);
+    render();
+  } else if (action === "share-note") {
+    void shareNote(target.dataset.noteId);
   } else if (action === "open-note") {
-    openNote(target.dataset.noteId);
+    if (target.dataset.noteContext === "favorite" && backend.enabled) {
+      void openVerifiedFavoriteNote(target.dataset.noteId);
+    } else {
+      openNote(target.dataset.noteId);
+    }
   } else if (action === "answer-question") {
     beginAnswerQuestion(target.dataset.questionId);
   } else if (action === "random-question") {
@@ -2121,6 +2475,7 @@ function handleTouchStart(event) {
   if (ui.route !== "wall" || !target.closest(".recommendation-page")) {
     return;
   }
+  if (target.closest(".note-quick-actions")) return;
 
   const touch = event.touches[0];
   touchGestureStart = {
@@ -2197,7 +2552,7 @@ function handleInput(event) {
     persisted.drafts.ask[persisted.role] = event.target.value;
     savePersistedState();
     updateCounter("ask-count", event.target.value, 80);
-    updatePreview("question", event.target.value || "你的问题会出现在这里");
+    event.target.dataset.noteDensity = noteTextDensity(event.target.value, "question");
   }
 
   if (event.target.id === "answer-body") {
@@ -2206,7 +2561,7 @@ function handleInput(event) {
     persisted.drafts.answer[question.id] = event.target.value;
     savePersistedState();
     updateCounter("answer-count", event.target.value, 160);
-    updatePreview("answer", event.target.value || "你的回答会出现在这里");
+    event.target.dataset.noteDensity = noteTextDensity(event.target.value, "answer");
   }
 }
 
@@ -2562,9 +2917,23 @@ function saveAnswerDraft(questionId) {
   showToast("草稿已保存。", false, 1600);
 }
 
+async function openVerifiedFavoriteNote(noteId) {
+  const result = await verifyPublicNote(noteId);
+  if (result.status === "available") {
+    openNote(result.note.id);
+    return;
+  }
+  if (result.status === "missing") {
+    render();
+    showToast("这张便签已下架，已从收藏中移除。", true, 2800);
+  } else {
+    showToast("暂时无法确认便签状态，请稍后再试。", true, 2600);
+  }
+}
+
 function openNote(noteId, { fromHistory = false } = {}) {
   const notes = getAvailableNotes();
-  const note = notes.find((item) => item.id === noteId);
+  const note = findViewableNote(noteId);
   if (!note) return;
   const group = notes.filter((item) => item.questionId === note.questionId);
   const otherAnswers = group.filter((item) => item.id !== note.id);
@@ -2602,19 +2971,19 @@ function openNote(noteId, { fromHistory = false } = {}) {
           : ""
       }
       <div class="dialog-actions">
-        <button class="button button-primary" type="button" data-dialog-action="answer" data-question-id="${note.questionId}">
+        <button class="button button-primary" type="button" data-dialog-action="answer" data-question-id="${escapeHtml(note.questionId)}">
           ${icon("pen-line")}
           我也来回答
         </button>
-        <button class="button" type="button" data-dialog-action="favorite" data-note-id="${note.id}">
+        <button class="button" type="button" data-dialog-action="favorite" data-note-id="${escapeHtml(note.id)}">
           ${icon(favorite ? "bookmark-check" : "bookmark")}
           ${favorite ? "已收藏" : "收藏"}
         </button>
-        <button class="button" type="button" data-dialog-action="share" data-note-id="${note.id}">
+        <button class="button" type="button" data-dialog-action="share" data-note-id="${escapeHtml(note.id)}">
           ${icon("share-2")}
           分享
         </button>
-        <button class="button button-ghost" type="button" data-dialog-action="report" data-note-id="${note.id}">
+        <button class="button button-ghost" type="button" data-dialog-action="report" data-note-id="${escapeHtml(note.id)}">
           ${icon("flag")}
           举报
         </button>
@@ -2625,6 +2994,7 @@ function openNote(noteId, { fromHistory = false } = {}) {
   dialog.scrollTop = 0;
   if (!dialog.open) dialog.showModal();
   dialog.scrollTop = 0;
+  void prepareNoteForShare(note.id);
 
   const activeOverlayNoteId = getNavigationSnapshot()?.overlayNoteId;
   if (!fromHistory && activeOverlayNoteId !== noteId) {
@@ -2636,9 +3006,22 @@ function openNote(noteId, { fromHistory = false } = {}) {
 function closeNoteDialog() {
   if (getNavigationSnapshot()?.overlayNoteId && navigationDepth > 0) {
     window.history.back();
-  } else if (dialog.open) {
-    dialog.close();
+    return;
   }
+  if (getNavigationSnapshot()?.overlayNoteId) {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("note");
+      window.history.replaceState(
+        createNavigationState(),
+        "",
+        `${url.pathname}${url.search}#${ui.route}`,
+      );
+    } catch {
+      window.history.replaceState(createNavigationState(), "", `#${ui.route}`);
+    }
+  }
+  if (dialog.open) dialog.close();
 }
 
 function handleDialogCancel(event) {
@@ -2667,7 +3050,7 @@ function handleDialogClick(event) {
     toggleFavorite(target.dataset.noteId);
     openNote(target.dataset.noteId);
   } else if (action === "share") {
-    shareNote(target.dataset.noteId);
+    void shareNote(target.dataset.noteId);
   } else if (action === "report") {
     if (window.confirm("确认举报这张便签吗？")) {
       submitReport(target.dataset.noteId);
@@ -2693,38 +3076,451 @@ async function submitReport(noteId) {
   closeNoteDialog();
 }
 
+async function verifyPublicNote(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id) return { status: "missing", note: null };
+  if (runtimeStatus.emergencyLockdown) return { status: "unavailable", note: null };
+  if (!backend.enabled) {
+    const note = findViewableNote(id);
+    if (note) markPublicNoteVerified(note);
+    return note ? { status: "available", note } : { status: "missing", note: null };
+  }
+  if (!remoteAvailable || typeof backend.loadNote !== "function") {
+    return { status: "unavailable", note: null };
+  }
+
+  let note;
+  try {
+    note = await backend.loadNote(id);
+  } catch (error) {
+    console.warn("Unable to verify the note against the public wall.", error);
+    return { status: "unavailable", note: null };
+  }
+  if (!remoteAvailable || runtimeStatus.emergencyLockdown) {
+    return { status: "unavailable", note: null };
+  }
+  if (!note) {
+    invalidateFavoriteNote(id);
+    return { status: "missing", note: null };
+  }
+
+  const liveIndex = remoteNotes.findIndex((item) => item.id === id);
+  if (liveIndex >= 0) remoteNotes[liveIndex] = note;
+  markPublicNoteVerified(note);
+  if (persisted.favorites.includes(id)) {
+    const snapshot = createFavoriteNoteSnapshot(note);
+    if (snapshot) {
+      const snapshotsById = new Map(persisted.favoriteNotes.map((item) => [item.id, item]));
+      snapshotsById.set(id, snapshot);
+      persisted.favoriteNotes = persisted.favorites
+        .map((favoriteId) => snapshotsById.get(favoriteId))
+        .filter(Boolean);
+      validatedFavoriteNoteIds.add(id);
+      savePersistedState();
+    }
+  }
+  return { status: "available", note };
+}
+
+function invalidateFavoriteNote(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id) return false;
+  const previousCount = persisted.favorites.length;
+  persisted.favorites = persisted.favorites.filter((favoriteId) => favoriteId !== id);
+  persisted.favoriteNotes = persisted.favoriteNotes.filter((note) => note.id !== id);
+  validatedFavoriteNoteIds.delete(id);
+  verifiedPublicNotes.delete(id);
+  verifiedPublicNoteTimestamps.delete(id);
+  noteShareImageCache.delete(id);
+  if (persisted.favorites.length !== previousCount) savePersistedState();
+  return persisted.favorites.length !== previousCount;
+}
+
 function toggleFavorite(noteId) {
-  const index = persisted.favorites.indexOf(noteId);
+  const note = findViewableNote(noteId);
+  if (!note) return false;
+  const index = persisted.favorites.indexOf(note.id);
   if (index >= 0) persisted.favorites.splice(index, 1);
-  else persisted.favorites.push(noteId);
-  savePersistedState();
-  showToast(index >= 0 ? "已取消收藏。" : "已收藏。", false, 1400);
+  else {
+    persisted.favorites.push(note.id);
+    validatedFavoriteNoteIds.add(note.id);
+    markPublicNoteVerified(note);
+    if (persisted.favorites.length > FAVORITE_LIMIT) {
+      const removedIds = persisted.favorites.splice(0, persisted.favorites.length - FAVORITE_LIMIT);
+      removedIds.forEach((id) => {
+        validatedFavoriteNoteIds.delete(id);
+      });
+    }
+  }
+  if (index >= 0) {
+    validatedFavoriteNoteIds.delete(note.id);
+  }
+  syncFavoriteNoteSnapshots({ save: false });
+  const saved = savePersistedState();
+  showToast(
+    saved
+      ? index >= 0
+        ? "已取消收藏。"
+        : "已收藏，可在“我的”里再次分享。"
+      : "当前浏览器无法长期保存收藏。",
+    !saved,
+    saved ? 1800 : 2600,
+  );
+  return index < 0;
+}
+
+async function prepareNoteForShare(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id) return { status: "missing", note: null, imageBlob: null };
+  const pending = noteSharePreparationPromises.get(id);
+  if (pending) return pending;
+
+  const preparation = (async () => {
+    let note = getFreshVerifiedPublicNote(id);
+    if (!note) {
+      const verification = await verifyPublicNote(id);
+      if (verification.status !== "available") {
+        return { ...verification, imageBlob: null };
+      }
+      note = verification.note;
+    }
+
+    const cached = getPreparedNoteShareImage(note);
+    if (cached) return { status: "ready", note, imageBlob: cached.blob };
+
+    let imageBlob = null;
+    try {
+      imageBlob = await createNoteImageBlob(note);
+    } catch (error) {
+      console.warn("Unable to create a share image for this note.", error);
+    }
+
+    const current = getFreshVerifiedPublicNote(id);
+    if (!current || noteShareContentKey(current) !== noteShareContentKey(note)) {
+      return { status: "unavailable", note: null, imageBlob: null };
+    }
+    cachePreparedNoteShareImage(current, imageBlob);
+    return { status: "ready", note: current, imageBlob };
+  })();
+
+  noteSharePreparationPromises.set(id, preparation);
+  preparation.finally(() => {
+    if (noteSharePreparationPromises.get(id) === preparation) {
+      noteSharePreparationPromises.delete(id);
+    }
+  });
+  return preparation;
+}
+
+function noteShareContentKey(note) {
+  return JSON.stringify([note?.direction || "", note?.question || "", note?.answer || ""]);
+}
+
+function getPreparedNoteShareImage(note) {
+  const id = normalizePublicNoteId(note?.id);
+  if (!id) return null;
+  const cached = noteShareImageCache.get(id);
+  if (!cached || cached.contentKey !== noteShareContentKey(note)) {
+    noteShareImageCache.delete(id);
+    return null;
+  }
+  noteShareImageCache.delete(id);
+  noteShareImageCache.set(id, cached);
+  return cached;
+}
+
+function cachePreparedNoteShareImage(note, blob) {
+  const id = normalizePublicNoteId(note?.id);
+  if (!id) return;
+  noteShareImageCache.delete(id);
+  noteShareImageCache.set(id, { contentKey: noteShareContentKey(note), blob: blob || null });
+  while (noteShareImageCache.size > NOTE_SHARE_IMAGE_CACHE_LIMIT) {
+    const oldestId = noteShareImageCache.keys().next().value;
+    noteShareImageCache.delete(oldestId);
+  }
 }
 
 async function shareNote(noteId) {
-  const note = getAvailableNotes().find((item) => item.id === noteId);
-  if (!note) return;
-  const text = `${note.question}\n${note.answer}`;
-  try {
-    if (navigator.share) {
-      await navigator.share({ title: "问问墙的一张便签", text });
+  const id = normalizePublicNoteId(noteId);
+  const note = getFreshVerifiedPublicNote(id);
+  const prepared = note ? getPreparedNoteShareImage(note) : null;
+  if (!note || !prepared) {
+    const preparation = prepareNoteForShare(id);
+    showToast("正在准备便签图片…", false, 1800);
+    const result = await preparation;
+    if (result.status === "ready") {
+      showToast("便签已准备好，请再点一次分享。", false, 2600);
+    } else if (result.status === "missing") {
+      render();
+      showToast("这张便签已下架，无法继续分享。", true, 2800);
     } else {
-      await navigator.clipboard.writeText(text);
-      showToast("便签文字已复制。", false, 1600);
+      showToast("暂时无法确认便签状态，请稍后再试。", true, 2600);
     }
-  } catch (error) {
-    if (error?.name !== "AbortError") showToast("暂时无法分享，请稍后再试。", true);
+    return;
   }
+
+  const url = createWallShareUrl(note.id);
+  const text = `问：${note.question}\n答：${note.answer}`;
+  const imageBlob = prepared.blob;
+
+  if (!nativeShareUnavailable && typeof navigator.share === "function") {
+    let file = null;
+    let canShareFile = false;
+    if (
+      imageBlob &&
+      !nativeFileShareUnavailable &&
+      typeof navigator.canShare === "function" &&
+      typeof File === "function"
+    ) {
+      try {
+        file = new File([imageBlob], noteImageFilename(note), { type: "image/png" });
+        canShareFile = navigator.canShare({ files: [file] });
+        if (!canShareFile) nativeFileShareUnavailable = true;
+      } catch (error) {
+        nativeFileShareUnavailable = true;
+        console.warn("Unable to prepare the note image for native sharing.", error);
+      }
+    }
+
+    if (file && canShareFile) {
+      const result = await attemptNativeShare({
+        title: "问问墙的一张便签",
+        text: `${text}\n${url}`,
+        files: [file],
+      });
+      if (result === "failed") {
+        nativeFileShareUnavailable = true;
+        showToast("图片分享未能打开，请再点一次分享文字和链接。", true, 3000);
+      }
+      return;
+    }
+
+    const result = await attemptNativeShare({ title: "问问墙的一张便签", text, url });
+    if (result === "failed") {
+      nativeShareUnavailable = true;
+      showToast("系统分享不可用，请再点一次分享按钮，复制链接并保存图片。", true, 3400);
+    }
+    return;
+  }
+
+  const copyPromise = copyShareText(`${text}\n${url}`);
+  let downloaded = false;
+  if (imageBlob) {
+    try {
+      downloadNoteImage(imageBlob, note);
+      downloaded = true;
+    } catch (error) {
+      console.warn("Unable to download the note image.", error);
+    }
+  }
+  const copied = await copyPromise;
+
+  if (downloaded) {
+    showToast(copied ? "便签图片已保存，分享文字已复制。" : "便签图片已保存。", false, 2400);
+  } else {
+    showToast(copied ? "便签文字和链接已复制。" : "暂时无法分享，请稍后再试。", !copied, 2200);
+  }
+}
+
+async function attemptNativeShare(payload) {
+  try {
+    await navigator.share(payload);
+    return "shared";
+  } catch (error) {
+    if (error?.name === "AbortError") return "aborted";
+    console.warn("Native sharing failed; trying the next fallback.", error);
+    return "failed";
+  }
+}
+
+function createWallShareUrl(noteId) {
+  const url = new URL(window.location.href);
+  url.search = "";
+  const id = normalizePublicNoteId(noteId);
+  if (id) url.searchParams.set("note", id);
+  url.hash = "wall";
+  return url.href;
+}
+
+function noteImageFilename(note) {
+  const safeTitle = Array.from(note.question)
+    .slice(0, 12)
+    .join("")
+    .replace(/[\\/:*?"<>|]/g, "")
+    .trim();
+  return `问问墙-${safeTitle || "便签"}.png`;
+}
+
+async function copyShareText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function downloadNoteImage(blob, note) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = noteImageFilename(note);
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+async function createNoteImageBlob(note) {
+  const template = noteExportTemplates[note.direction] || noteExportTemplates.child_to_adult;
+  const image = await loadNoteTemplateImage(template.asset);
+  const canvas = document.createElement("canvas");
+  canvas.width = template.width;
+  canvas.height = template.height;
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) throw new Error("Canvas is unavailable.");
+
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  drawNoteCanvasText(context, note.question, template.question, template, 700);
+  drawNoteCanvasText(context, note.answer, template.answer, template, 600);
+
+  return canvasToPngBlob(canvas);
+}
+
+function loadNoteTemplateImage(asset) {
+  if (noteTemplateImageCache.has(asset)) return noteTemplateImageCache.get(asset);
+  const imagePromise = new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(`Unable to load ${asset}`));
+    image.src = new URL(asset, window.location.href).href;
+  });
+  noteTemplateImageCache.set(asset, imagePromise);
+  imagePromise.catch(() => {
+    if (noteTemplateImageCache.get(asset) === imagePromise) noteTemplateImageCache.delete(asset);
+  });
+  return imagePromise;
+}
+
+function drawNoteCanvasText(context, value, region, template, fontWeight) {
+  const box = {
+    x: Math.round(region.x * template.width),
+    y: Math.round(region.y * template.height),
+    width: Math.round(region.width * template.width),
+    height: Math.round(region.height * template.height),
+  };
+  const padding = Math.max(8, Math.round(box.width * 0.012));
+  const fit = fitCanvasText(
+    context,
+    value,
+    box.width - padding * 2,
+    box.height - padding * 2,
+    region.maxFont,
+    region.minFont,
+    fontWeight,
+  );
+
+  context.save();
+  context.fillStyle = template.ink;
+  context.font = canvasFont(fontWeight, fit.fontSize);
+  context.textBaseline = "top";
+  context.shadowColor = "rgba(255, 255, 255, 0.64)";
+  context.shadowOffsetY = 1;
+  fit.lines.forEach((line, index) => {
+    context.fillText(line, box.x + padding, box.y + padding + index * fit.lineHeight);
+  });
+  context.restore();
+}
+
+function fitCanvasText(context, value, maxWidth, maxHeight, maxFont, minFont, fontWeight) {
+  let text = String(value || "").trim();
+  const fitText = () => {
+    for (let fontSize = maxFont; fontSize >= minFont; fontSize -= 2) {
+      context.font = canvasFont(fontWeight, fontSize);
+      const lines = wrapCanvasText(context, text, maxWidth);
+      const lineHeight = Math.round(fontSize * 1.55);
+      if (lines.length * lineHeight <= maxHeight) return { lines, fontSize, lineHeight };
+    }
+    return null;
+  };
+
+  const fitted = fitText();
+  if (fitted) return fitted;
+
+  const compactedText = text.replace(/\s*\n+\s*/g, " ");
+  if (compactedText !== text) {
+    text = compactedText;
+    const compactedFit = fitText();
+    if (compactedFit) return compactedFit;
+  }
+
+  context.font = canvasFont(fontWeight, minFont);
+  const lineHeight = Math.round(minFont * 1.55);
+  const lines = wrapCanvasText(context, text, maxWidth);
+  const maxLines = Math.max(1, Math.floor(maxHeight / lineHeight));
+  const visibleLines = lines.slice(0, maxLines);
+  if (lines.length > maxLines) {
+    const graphemes = splitGraphemes(visibleLines[maxLines - 1]);
+    while (graphemes.length && context.measureText(`${graphemes.join("")}…`).width > maxWidth) {
+      graphemes.pop();
+    }
+    visibleLines[maxLines - 1] = `${graphemes.join("")}…`;
+  }
+  return { lines: visibleLines, fontSize: minFont, lineHeight };
+}
+
+function wrapCanvasText(context, value, maxWidth) {
+  const lines = [];
+  String(value || "")
+    .replaceAll("\r", "")
+    .split("\n")
+    .forEach((paragraph) => {
+      if (!paragraph) {
+        lines.push("");
+        return;
+      }
+      let line = "";
+      splitGraphemes(paragraph).forEach((grapheme) => {
+        const candidate = `${line}${grapheme}`;
+        if (line && context.measureText(candidate).width > maxWidth) {
+          lines.push(line);
+          line = grapheme;
+        } else {
+          line = candidate;
+        }
+      });
+      if (line) lines.push(line);
+    });
+  return lines.length ? lines : [""];
+}
+
+function splitGraphemes(value) {
+  if (globalThis.Intl?.Segmenter) {
+    return [...new Intl.Segmenter("zh-CN", { granularity: "grapheme" }).segment(value)].map(
+      (item) => item.segment,
+    );
+  }
+  return Array.from(value);
+}
+
+function canvasFont(weight, size) {
+  return `${weight} ${size}px "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif`;
+}
+
+function canvasToPngBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("Unable to encode the note image."));
+    }, "image/png");
+  });
 }
 
 function updateCounter(id, value, limit) {
   const counter = document.getElementById(id);
   if (counter) counter.textContent = `${countCharacters(value)} / ${limit}`;
-}
-
-function updatePreview(type, value) {
-  const element = document.querySelector(`[data-preview="${type}"]`);
-  if (element) element.textContent = value;
 }
 
 function showToast(message, isError = false, duration = 2200) {

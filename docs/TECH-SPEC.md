@@ -226,7 +226,7 @@ admin_get_runtime_settings
 - 部署必须依次应用 `0001`、`0002`、`0003`、`0004`；`0004` 是 schema v3 的发布加固，不改变公开契约版本号。
 - Pages 构建只接受 HTTPS 的托管 Supabase URL，并要求 `SUPABASE_URL` 与 `SUPABASE_ANON_KEY`。
 - 静态页面通过 CSP 将脚本和样式限制为同源，连接目标限制为同源和托管 Supabase；Lucide 1.8.0 使用项目内 vendor 文件，不依赖运行时 CDN。
-- 当前公开页资源版本为 styles/app v13、backend/config v3；修改资源后需同步更新 HTML 查询参数以刷新移动端缓存。
+- 当前公开页资源版本为 styles/app v16、backend v4、config v3；修改资源后需同步更新 HTML 查询参数以刷新移动端缓存。
 - 工作流运行三个 JavaScript 语法检查和后端契约测试，然后调用 `moderation_status`；只有 `schemaVersion = 3`、`hardeningVersion = 1` 且 `submissionsRequireReview = true` 才发布。
 - hardening marker 可确认远端已应用 `0004`，但探针不会穷举检查全部 RPC、权限或字段，发布后仍需执行移动端与权限验收。
 - Pages 静态文件回滚不会回滚数据库迁移。
