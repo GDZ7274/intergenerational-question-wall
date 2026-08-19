@@ -208,6 +208,7 @@ let remoteLoadFailed = false;
 let validatedFavoriteNoteIds = new Set();
 const verifiedPublicNotes = new Map();
 const verifiedPublicNoteTimestamps = new Map();
+let publicNoteVerificationEpoch = 0;
 let nativeFileShareUnavailable = false;
 let nativeShareUnavailable = false;
 let runtimeStatus = {
@@ -367,7 +368,15 @@ async function reconcileRemoteFavorites() {
   }
 
   try {
+    const verificationEpoch = publicNoteVerificationEpoch;
     const publicNotes = await backend.loadNotes(favoriteIds);
+    if (
+      verificationEpoch !== publicNoteVerificationEpoch ||
+      !remoteAvailable ||
+      runtimeStatus.emergencyLockdown
+    ) {
+      return false;
+    }
     const snapshotsById = new Map(
       publicNotes
         .map(createFavoriteNoteSnapshot)
@@ -429,12 +438,14 @@ function markPublicNoteVerified(note, verifiedAt = Date.now()) {
 }
 
 function replacePublicNoteVerification(notes) {
+  publicNoteVerificationEpoch += 1;
   verifiedPublicNotes.clear();
   verifiedPublicNoteTimestamps.clear();
   (Array.isArray(notes) ? notes : []).forEach((note) => markPublicNoteVerified(note));
 }
 
 function clearPublicNoteVerification({ clearShareImages = true } = {}) {
+  publicNoteVerificationEpoch += 1;
   verifiedPublicNotes.clear();
   verifiedPublicNoteTimestamps.clear();
   if (clearShareImages) noteShareImageCache.clear();
@@ -3090,13 +3101,18 @@ async function verifyPublicNote(noteId) {
   }
 
   let note;
+  const verificationEpoch = publicNoteVerificationEpoch;
   try {
     note = await backend.loadNote(id);
   } catch (error) {
     console.warn("Unable to verify the note against the public wall.", error);
     return { status: "unavailable", note: null };
   }
-  if (!remoteAvailable || runtimeStatus.emergencyLockdown) {
+  if (
+    verificationEpoch !== publicNoteVerificationEpoch ||
+    !remoteAvailable ||
+    runtimeStatus.emergencyLockdown
+  ) {
     return { status: "unavailable", note: null };
   }
   if (!note) {

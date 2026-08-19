@@ -732,3 +732,74 @@ test("a stale verification response cannot restore sharing after the wall goes o
   assert.equal(shareCalls.length, 0);
   assert.equal(vm.runInContext(`noteShareImageCache.has(${JSON.stringify(note.id)})`, sandbox), true);
 });
+
+test("a verification started before lockdown stays stale after the wall recovers", async () => {
+  const note = {
+    id: "lockdown-race-note-101",
+    questionId: "lockdown-race-question-101",
+    answerId: "lockdown-race-answer-101",
+    direction: "child_to_adult",
+    question: "关闭前发出的请求能在恢复后继续生效吗？",
+    answer: "恢复后的公开状态必须由新的校验结果决定。",
+    createdAt: "2026-01-06T00:00:00.000Z",
+    featured: false,
+    answerCount: 1,
+  };
+  let resolveFirstLoad;
+  const firstLoad = new Promise((resolve) => {
+    resolveFirstLoad = resolve;
+  });
+  const calls = { loadNote: 0, createImage: 0 };
+  const shareCalls = [];
+  const { sandbox } = createHarness({
+    async share(payload) {
+      shareCalls.push(payload);
+    },
+    canShare() {
+      return true;
+    },
+    backend: {
+      enabled: true,
+      experienceMode: false,
+      async loadNote() {
+        calls.loadNote += 1;
+        return calls.loadNote === 1 ? firstLoad : null;
+      },
+    },
+  });
+  sandbox.__lockdownRaceCalls = calls;
+  vm.runInContext(
+    `createNoteImageBlob = async () => {
+       __lockdownRaceCalls.createImage += 1;
+       return { type: "image/png" };
+     };
+     remoteAvailable = true`,
+    sandbox,
+  );
+
+  const preparation = vm.runInContext(
+    `prepareNoteForShare(${JSON.stringify(note.id)})`,
+    sandbox,
+  );
+  assert.equal(calls.loadNote, 1);
+
+  vm.runInContext(
+    `runtimeStatus.emergencyLockdown = true;
+     clearPublicNoteVerification();
+     runtimeStatus.emergencyLockdown = false;
+     remoteAvailable = true;
+     replacePublicNoteVerification([])`,
+    sandbox,
+  );
+  resolveFirstLoad(note);
+  const result = await preparation;
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(calls.createImage, 0);
+  assert.equal(vm.runInContext(`getFreshVerifiedPublicNote(${JSON.stringify(note.id)})`, sandbox), null);
+
+  await vm.runInContext(`shareNote(${JSON.stringify(note.id)})`, sandbox);
+
+  assert.equal(calls.loadNote, 2, "sharing after recovery must use a new verification request");
+  assert.equal(shareCalls.length, 0);
+});
