@@ -269,6 +269,7 @@ test("the completed wall shows a replay prompt and keeps downward swipe history"
   assert.match(endHtml, /assets\/ending-duck\.gif/);
   assert.match(endHtml, /哎鸭，被你看完啦/);
   assert.match(endHtml, /下滑回看上一张/);
+  assert.doesNotMatch(endHtml, /recommendation-end-kicker/);
   assert.doesNotMatch(endHtml, /推荐/);
 });
 

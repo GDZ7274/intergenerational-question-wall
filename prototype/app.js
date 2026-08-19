@@ -1573,7 +1573,6 @@ function renderRecommendationEnd() {
         <div class="recommendation-end-scene" role="status">
           <img class="recommendation-end-gif" src="assets/ending-duck.gif" alt="" aria-hidden="true" />
           <div class="recommendation-end-dialog">
-            <p class="recommendation-end-kicker">看完啦</p>
             <h1>哎鸭，被你看完啦</h1>
             <p>下滑回看刚刚的便签</p>
           </div>
