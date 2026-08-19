@@ -233,6 +233,20 @@ test("recommendation quick favorite action exposes its pressed state", () => {
   );
 });
 
+test("a remembered completed feed does not claim that the public wall is empty", () => {
+  const { sandbox } = createHarness();
+  const completedHtml = vm.runInContext(
+    `getAvailableNotes().forEach((note) => seenNoteIds.add(note.id));
+     ui.recommendationIds = [];
+     ui.recommendationIndex = -1;
+     renderRecommendationPage()`,
+    sandbox,
+  );
+
+  assert.match(completedHtml, /这一批便签看完了/);
+  assert.doesNotMatch(completedHtml, /暂时没有公开便签/);
+});
+
 test("canvas text helpers wrap graphemes and shrink text to fit", () => {
   const { sandbox } = createHarness();
   sandbox.__canvasContext = {

@@ -1470,6 +1470,7 @@ function renderNoteQuickActions(note, context = "feed") {
 
 function renderRecommendationEnd() {
   const canGoBack = ui.recommendationIds.length > 0;
+  const completedBatch = canGoBack || getAvailableNotes().length > 0;
   return `
     <section class="single-note-viewer recommendation-end-viewer feed-motion-${ui.feedMotion}" aria-label="推荐结束">
       <div class="single-note-viewer-head">
@@ -1480,11 +1481,11 @@ function renderRecommendationEnd() {
           ${icon("chevron-up")}
         </button>
         <div class="recommendation-end" role="status">
-          <span class="recommendation-end-icon" aria-hidden="true">${icon(canGoBack ? "check" : "clock-3")}</span>
+          <span class="recommendation-end-icon" aria-hidden="true">${icon(completedBatch ? "check" : "clock-3")}</span>
           <div>
-            <p class="page-kicker">${canGoBack ? "已经看到这里" : "便签正在路上"}</p>
-            <h1>${canGoBack ? "这一批便签看完了" : "暂时没有公开便签"}</h1>
-            <p>${canGoBack ? "有新便签时，推荐会从这里继续。" : "新的问答通过审核后会出现在这里。"}</p>
+            <p class="page-kicker">${completedBatch ? "已经看到这里" : "便签正在路上"}</p>
+            <h1>${completedBatch ? "这一批便签看完了" : "暂时没有公开便签"}</h1>
+            <p>${completedBatch ? "有新便签时，推荐会从这里继续。" : "新的问答通过审核后会出现在这里。"}</p>
           </div>
         </div>
       </div>
