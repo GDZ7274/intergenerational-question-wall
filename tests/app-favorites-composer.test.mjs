@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -231,6 +232,63 @@ test("recommendation quick favorite action exposes its pressed state", () => {
     favoriteHtml,
     /data-action="toggle-favorite"[\s\S]*?data-note-id="note-01"[\s\S]*?aria-pressed="true"/,
   );
+});
+
+test("landing uses the approved campaign artwork and concise mobile choices", () => {
+  const { sandbox } = createHarness();
+  const html = vm.runInContext("renderLandingPage()", sandbox);
+
+  assert.match(html, /assets\/hero-overlay\.png/);
+  assert.match(html, /assets\/landing-duck\.png/);
+  assert.match(html, /今天想从哪件事开始？/);
+  assert.match(html, /留一个问题/);
+  assert.match(html, /回答一张便签/);
+  assert.match(html, /下滑先看看/);
+  assert.doesNotMatch(html, /把一个问题，交给另一代/);
+});
+
+test("the photographed note wall remains visible behind every route", () => {
+  assert.match(
+    stylesSource,
+    /\.site-background \{[\s\S]*?wall-scene\.png[\s\S]*?background-size: cover;[\s\S]*?\}/,
+  );
+  assert.match(
+    stylesSource,
+    /body\.is-immersive-route \.site-frost \{[\s\S]*?background: rgba\(247, 244, 239, 0\.08\);[\s\S]*?blur\(10px\)/,
+  );
+  assert.match(stylesSource, /\.site-background,[\s\S]*?position: fixed;[\s\S]*?inset: 0;/);
+  assert.match(stylesSource, /body\.is-opening \.site-background \{[\s\S]*?scale\(1\.01\)/);
+});
+
+test("a downward landing swipe enters the one-note wall", () => {
+  const { sandbox } = createHarness();
+  sandbox.__touchEndEvent = {
+    changedTouches: [{ clientX: 120, clientY: 180 }],
+    cancelable: true,
+    preventDefault() {},
+  };
+
+  vm.runInContext(
+    `ui.route = "home";
+     touchGestureStart = { kind: "landing", x: 120, y: 120, axis: "y", startedAt: 900 };
+     handleTouchEnd(__touchEndEvent);`,
+    sandbox,
+  );
+
+  assert.equal(vm.runInContext("ui.route", sandbox), "wall");
+});
+
+test("approved raster assets retain their original bytes", async () => {
+  const expected = new Map([
+    ["wall-scene.png", "c0ed35231c52e3e603c879bf63c825b8edfa07c00dcb617ee7671f75be75d2c7"],
+    ["hero-overlay.png", "8b47fd1c190d7db8d0ae434128aac29437446a99661279e773866507e7eaaeae"],
+    ["landing-duck.png", "5e0d841a22301c4b4618cae8fc386253c851872519ba7577fbbe6b333d169998"],
+  ]);
+
+  for (const [name, digest] of expected) {
+    const bytes = await readFile(new URL(`../prototype/assets/${name}`, import.meta.url));
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), digest);
+  }
 });
 
 test("a remembered completed feed does not claim that the public wall is empty", () => {

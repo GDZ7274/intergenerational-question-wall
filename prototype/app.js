@@ -5,6 +5,9 @@ const HISTORY_STATE_KEY = "questionWallNavigation";
 const SEEN_NOTES_COOKIE_MAX_AGE = 60 * 60 * 24 * 180;
 const SEEN_NOTES_COOKIE_LIMIT = 100;
 const SWIPE_HINT_SESSION_KEY = "question-wall-swipe-hint-seen";
+const LANDING_OPENING_SESSION_KEY = "question-wall-opening-seen-v1";
+const LANDING_OPENING_DELAY_MS = 2_000;
+const WHEEL_GESTURE_COOLDOWN_MS = 420;
 const UNSAVED_RECEIPT_SESSION_KEY = "question-wall-unsaved-receipt-v1";
 const RUNTIME_POLL_INTERVAL_MS = 20_000;
 const FAVORITE_LIMIT = 120;
@@ -236,6 +239,7 @@ const ui = {
   recommendationComplete: false,
   feedMotion: "idle",
   showSwipeHint: shouldShowSwipeHint(),
+  landingOpeningActive: shouldPlayLandingOpening(),
   statusSyncing: false,
   editingSubmission: null,
   receiptFallback: pendingReceiptFallback,
@@ -254,6 +258,8 @@ let suppressClickUntil = 0;
 let navigationDepth = 0;
 let runtimeSyncPromise = null;
 let runtimePollTimer = null;
+let landingOpeningTimer = null;
+let wheelGestureReadyAt = 0;
 
 document.addEventListener("DOMContentLoaded", async () => {
   app.addEventListener("click", handleClick);
@@ -263,6 +269,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   app.addEventListener("touchmove", handleTouchMove, { passive: false });
   app.addEventListener("touchend", handleTouchEnd, { passive: false });
   app.addEventListener("touchcancel", handleTouchCancel, { passive: true });
+  app.addEventListener("wheel", handleWheel, { passive: false });
   document.addEventListener("keydown", handleKeydown);
   dialog.addEventListener("click", handleDialogClick);
   dialog.addEventListener("cancel", handleDialogCancel);
@@ -271,6 +278,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const initialOverlayNoteId = initializeNavigationHistory(getSharedNoteIdFromUrl());
   window.addEventListener("popstate", handlePopState);
   render();
+  scheduleLandingOpening();
   if (initialOverlayNoteId && !backend.enabled) openNote(initialOverlayNoteId, { fromHistory: true });
 
   if (backend.enabled) {
@@ -945,6 +953,39 @@ function dismissSwipeHint() {
   }
 }
 
+function shouldPlayLandingOpening() {
+  if (getRouteFromHash() !== "home") return false;
+  try {
+    return sessionStorage.getItem(LANDING_OPENING_SESSION_KEY) !== "1";
+  } catch {
+    return true;
+  }
+}
+
+function scheduleLandingOpening() {
+  if (!ui.landingOpeningActive || landingOpeningTimer !== null) return;
+  landingOpeningTimer = window.setTimeout(completeLandingOpening, LANDING_OPENING_DELAY_MS);
+}
+
+function completeLandingOpening() {
+  if (landingOpeningTimer !== null) {
+    window.clearTimeout(landingOpeningTimer);
+    landingOpeningTimer = null;
+  }
+  if (!ui.landingOpeningActive) return;
+
+  ui.landingOpeningActive = false;
+  try {
+    sessionStorage.setItem(LANDING_OPENING_SESSION_KEY, "1");
+  } catch {
+    // The opening can safely replay next session if storage is unavailable.
+  }
+
+  const bodyClasses = document.body?.classList;
+  bodyClasses?.remove("is-opening");
+  app.querySelector?.(".landing-shell")?.classList.remove("is-opening");
+}
+
 function normalizeRoute(route) {
   const allowed = ["home", "wall", "identity", "participate", "ask", "pool", "answer", "mine"];
   if (route === "discover") return "wall";
@@ -1015,6 +1056,7 @@ function initializeNavigationHistory(initialOverlayNoteId = "") {
 function navigate(route, options = {}) {
   const { replace = false, preserveIntent = false, ...stateUpdates } = options;
   const nextRoute = normalizeRoute(route);
+  if (nextRoute !== "home" && ui.landingOpeningActive) completeLandingOpening();
   if (ui.route === "identity" && nextRoute !== "identity" && !preserveIntent) {
     ui.pendingIntent = null;
   }
@@ -1048,6 +1090,7 @@ function handlePopState(event) {
   const snapshot = getNavigationSnapshot(event.state);
   navigationDepth = Number.isInteger(snapshot?.depth) && snapshot.depth >= 0 ? snapshot.depth : 0;
   ui.route = getRouteFromHash();
+  if (ui.route !== "home" && ui.landingOpeningActive) completeLandingOpening();
   ui.pendingIntent = null;
   ui.selectedQuestionId = typeof snapshot?.selectedQuestionId === "string" ? snapshot.selectedQuestionId : null;
 
@@ -1064,10 +1107,12 @@ function render() {
   const content = hasReceiptFallback ? renderReceiptFallbackPage() : renderRoute();
   const isLanding = !hasReceiptFallback && ui.route === "home";
   const isFeed = !hasReceiptFallback && ui.route === "wall";
+  const isOpening = isLanding && ui.landingOpeningActive;
   const hasMobileNav = !hasReceiptFallback && !isLanding && !["identity", "ask", "answer"].includes(ui.route);
   const runtimeNotice = hasReceiptFallback ? "" : renderRuntimeNotice(isLanding);
+  syncPageState({ isLanding, isFeed, isOpening });
   app.innerHTML = `
-    <div class="app-shell${hasMobileNav ? " has-mobile-nav" : ""}${isLanding ? " landing-shell" : ""}${isFeed ? " feed-shell" : ""}${runtimeNotice ? " has-runtime-notice" : ""}">
+    <div class="app-shell${hasMobileNav ? " has-mobile-nav" : ""}${isLanding ? " landing-shell" : ""}${isFeed ? " feed-shell" : ""}${isOpening ? " is-opening" : ""}${runtimeNotice ? " has-runtime-notice" : ""}">
       ${isLanding || hasReceiptFallback ? "" : renderTopbar()}
       ${runtimeNotice}
       <main id="main-content" class="page-main" tabindex="-1">${content}</main>
@@ -1077,6 +1122,15 @@ function render() {
   ui.feedMotion = "idle";
   refreshIcons();
   prewarmCurrentFeedNote();
+}
+
+function syncPageState({ isLanding, isFeed, isOpening }) {
+  const body = document.body;
+  if (!body?.classList) return;
+  body.classList.remove("is-booting");
+  body.classList.toggle("is-opening", isOpening);
+  body.classList.toggle("is-immersive-route", isLanding || isFeed);
+  if (body.dataset) body.dataset.route = ui.route;
 }
 
 function prewarmCurrentFeedNote() {
@@ -1140,6 +1194,15 @@ function renderReceiptFallbackPage() {
 
 function renderRuntimeNotice(isLanding) {
   if (
+    isLanding &&
+    ui.landingOpeningActive &&
+    backend.enabled &&
+    !remoteAvailable &&
+    !remoteLoadFailed
+  ) {
+    return "";
+  }
+  if (
     (!backend.enabled || remoteAvailable) &&
     !runtimeStatus.emergencyLockdown &&
     !runtimeStatus.readOnly &&
@@ -1200,37 +1263,47 @@ function renderRoute() {
 function renderLandingPage() {
   return `
     <section class="landing-page" aria-labelledby="landing-title">
-      <div class="landing-content">
-        <div class="landing-brand" aria-label="问问墙">
-          <span class="landing-brand-mark" aria-hidden="true"><i></i><i></i></span>
-          <span>问问墙</span>
-        </div>
-        <p class="landing-kicker">大人 × 小朋友 · 双向问答</p>
-        <h1 id="landing-title">把一个问题，交给另一代</h1>
-        <p class="landing-copy">你可以先问，也可以先回答。每一张便签，都是一次认真听见。</p>
+      ${renderCampaignHero()}
+      <div class="landing-welcome">
+        <div class="landing-content">
+          <img class="landing-duck" src="assets/landing-duck.png" alt="抱着铅笔的鸭鸭" />
+          <h1 id="landing-title">今天想从哪件事开始？</h1>
 
-        <div class="landing-actions">
-          <button class="landing-action landing-action-ask" type="button" data-action="landing-ask"${submissionsAreDisabled() ? " disabled" : ""}>
-            <span class="landing-action-icon">${icon("message-circle-question")}</span>
-            <span>我要提问</span>
-            ${icon("arrow-up-right")}
-          </button>
-          <button class="landing-action landing-action-answer" type="button" data-action="landing-answer"${submissionsAreDisabled() ? " disabled" : ""}>
-            <span class="landing-action-icon">${icon("messages-square")}</span>
-            <span>我要回答</span>
-            ${icon("arrow-up-right")}
+          <div class="landing-actions">
+            <button class="landing-action landing-action-ask" type="button" data-action="landing-ask"${submissionsAreDisabled() ? " disabled" : ""}>
+              <span class="landing-action-icon">${icon("help-circle")}</span>
+              <span class="landing-action-copy"><strong>留一个问题</strong><small>让另一代来回答</small></span>
+              ${icon("chevron-right")}
+            </button>
+            <button class="landing-action landing-action-answer" type="button" data-action="landing-answer"${submissionsAreDisabled() ? " disabled" : ""}>
+              <span class="landing-action-icon">${icon("pen-line")}</span>
+              <span class="landing-action-copy"><strong>回答一张便签</strong><small>从推荐内容开始</small></span>
+              ${icon("chevron-right")}
+            </button>
+          </div>
+
+          <button class="landing-browse" type="button" data-action="landing-browse" aria-label="下滑先看看，也可以轻点进入">
+            <span class="landing-browse-icon" aria-hidden="true">${icon("chevrons-down")}</span>
+            <span>下滑先看看</span>
           </button>
         </div>
-
-        <button class="landing-browse" type="button" data-action="landing-browse" aria-label="随便看看，也可以向上滑动进入">
-          <span class="landing-browse-line" aria-hidden="true"></span>
-          <span>随便看看</span>
-          <span class="landing-browse-arrow" aria-hidden="true">↑</span>
-        </button>
       </div>
-
-      <p class="landing-footnote">上滑直接浏览 · 参与时再选择身份</p>
     </section>
+  `;
+}
+
+function renderCampaignHero({ canExit = false } = {}) {
+  return `
+    <div class="campaign-hero">
+      <img src="assets/hero-overlay.png" alt="躺倒鸭解鸭留言墙" />
+      ${
+        canExit
+          ? `<button class="campaign-exit" type="button" data-action="landing-return" aria-label="退出浏览，返回参与入口">
+              ${icon("x")}
+            </button>`
+          : ""
+      }
+    </div>
   `;
 }
 
@@ -1323,6 +1396,7 @@ function renderRecommendationPage() {
   const note = ui.recommendationComplete ? null : getCurrentRecommendation();
   return `
     <section class="recommendation-page" aria-label="推荐问答">
+      ${renderCampaignHero({ canExit: true })}
       <div class="recommendation-content">
         ${note ? renderSingleNoteViewer(note) : renderRecommendationEnd()}
       </div>
@@ -1333,6 +1407,7 @@ function renderRecommendationPage() {
 function renderEmergencyWallState() {
   return `
     <section class="recommendation-page" aria-label="问答墙状态">
+      ${renderCampaignHero({ canExit: true })}
       <div class="recommendation-content">
         <section class="single-note-viewer recommendation-end-viewer" aria-label="问答墙暂时关闭">
           <div class="single-note-stage">
@@ -1354,6 +1429,7 @@ function renderEmergencyWallState() {
 function renderRemoteAvailabilityState() {
   return `
     <section class="recommendation-page" aria-label="问答墙状态">
+      ${renderCampaignHero({ canExit: true })}
       <div class="recommendation-content">
         <section class="single-note-viewer recommendation-end-viewer" aria-label="在线内容状态">
           <div class="single-note-stage">
@@ -2327,6 +2403,8 @@ function handleClick(event) {
     startAnswer();
   } else if (action === "landing-browse") {
     navigate("wall");
+  } else if (action === "landing-return") {
+    navigate("home");
   } else if (action === "wall-prev") {
     moveWall(-1);
   } else if (action === "wall-next") {
@@ -2560,7 +2638,7 @@ function handleTouchEnd(event) {
   const verticalSwipe = hasVerticalIntent && (hasSwipeDistance || isFastVerticalFlick);
 
   if (start.kind === "landing") {
-    if (dy < 0 && verticalSwipe) {
+    if (dy > 0 && verticalSwipe) {
       if (event.cancelable) event.preventDefault();
       suppressClickUntil = performance.now() + 450;
       navigate("wall");
@@ -2581,6 +2659,25 @@ function handleTouchEnd(event) {
 
 function handleTouchCancel() {
   touchGestureStart = null;
+}
+
+function handleWheel(event) {
+  const target = event.target;
+  const onLanding = ui.route === "home" && target.closest?.(".landing-page");
+  const onViewer = ui.route === "wall" && target.closest?.(".recommendation-page");
+  if ((!onLanding && !onViewer) || Math.abs(event.deltaY) <= 20) return;
+  if (target.closest?.(".note-quick-actions")) return;
+
+  if (event.cancelable) event.preventDefault();
+  const now = performance.now();
+  if (now < wheelGestureReadyAt) return;
+  wheelGestureReadyAt = now + WHEEL_GESTURE_COOLDOWN_MS;
+
+  if (onLanding) {
+    if (event.deltaY > 0) navigate("wall");
+    return;
+  }
+  moveWall(event.deltaY > 0 ? 1 : -1);
 }
 
 function handleInput(event) {

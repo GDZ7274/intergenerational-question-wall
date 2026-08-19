@@ -41,6 +41,9 @@ jobs:
           test -f prototype/admin.html
           test -f prototype/admin.css
           test -f prototype/assets/note-wall-background.jpg
+          test -f prototype/assets/wall-scene.png
+          test -f prototype/assets/hero-overlay.png
+          test -f prototype/assets/landing-duck.png
           test -f prototype/vendor/lucide.min.js
           test -f supabase/migrations/0003_operational_controls.sql
           test -f supabase/migrations/0004_release_hardening.sql
