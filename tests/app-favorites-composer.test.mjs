@@ -247,6 +247,36 @@ test("a remembered completed feed does not claim that the public wall is empty",
   assert.doesNotMatch(completedHtml, /暂时没有公开便签/);
 });
 
+test("wall end states distinguish empty, unavailable, and emergency modes", () => {
+  const emptyHarness = createHarness({
+    backend: { enabled: true, experienceMode: false },
+  });
+  const emptyHtml = vm.runInContext(
+    "remoteAvailable = true; remoteNotes = []; renderRecommendationPage()",
+    emptyHarness.sandbox,
+  );
+  assert.match(emptyHtml, /暂时没有公开便签/);
+
+  const unavailableHarness = createHarness({
+    backend: { enabled: true, experienceMode: false },
+  });
+  const unavailableHtml = vm.runInContext(
+    "remoteAvailable = false; remoteLoadFailed = true; renderRecommendationPage()",
+    unavailableHarness.sandbox,
+  );
+  assert.match(unavailableHtml, /暂时无法读取便签/);
+
+  const emergencyHarness = createHarness({
+    backend: { enabled: true, experienceMode: false },
+  });
+  const emergencyHtml = vm.runInContext(
+    "remoteAvailable = true; runtimeStatus.emergencyLockdown = true; renderRecommendationPage()",
+    emergencyHarness.sandbox,
+  );
+  assert.match(emergencyHtml, /问答墙暂时关闭/);
+  assert.doesNotMatch(emergencyHtml, /暂时没有公开便签/);
+});
+
 test("canvas text helpers wrap graphemes and shrink text to fit", () => {
   const { sandbox } = createHarness();
   sandbox.__canvasContext = {

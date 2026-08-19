@@ -96,7 +96,7 @@ git push -u origin main
 
 工作流会运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs` 中的后端契约、投稿恢复码安全测试，核对关键资源、本地化图标和 `0003` / `0004` 迁移文件，再验证远端 schema v3 与 hardening v1。随后复制 `prototype/` 到临时发布目录，并用仓库变量生成仅用于线上 artifact 的 `config.js`。仓库中的 `prototype/config.js` 会继续保留空配置，方便本地演示，也避免把项目地址硬编码进源码。缺少变量、URL 不是托管 Supabase HTTPS 地址或数据库迁移不兼容时，工作流会主动失败。该探针能确认远端已应用带 hardening marker 的 `0004`，但不能替代全部 RPC、权限和发布后业务验收；Pages 回滚不会回滚数据库。
 
-当前公开页缓存版本为 `styles.css?v=16`、`app.js?v=17`、`backend.js?v=4`、`config.js?v=3`，后台为 `admin.css?v=5`、`admin.js?v=6`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 默认只允许同源脚本与样式，网络连接仅放行同源和 `https://*.supabase.co`。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
+当前公开页缓存版本为 `styles.css?v=16`、`app.js?v=18`、`backend.js?v=4`、`config.js?v=4`，后台为 `admin.css?v=5`、`admin.js?v=6`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 默认只允许同源脚本与样式，网络连接仅放行同源和 `https://*.supabase.co`。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
 
 以后每次向 `main` 推送都会自动更新网站。由于浏览器和 CDN 可能缓存静态资源，发布后应在手机上重新打开页面或执行一次强制刷新。
 

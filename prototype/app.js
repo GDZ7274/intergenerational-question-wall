@@ -1314,6 +1314,9 @@ function renderWallPage() {
 }
 
 function renderRecommendationPage() {
+  if (runtimeStatus.emergencyLockdown) {
+    return renderEmergencyWallState();
+  }
   if (backend.enabled && !remoteAvailable) {
     return renderRemoteAvailabilityState();
   }
@@ -1322,6 +1325,27 @@ function renderRecommendationPage() {
     <section class="recommendation-page" aria-label="推荐问答">
       <div class="recommendation-content">
         ${note ? renderSingleNoteViewer(note) : renderRecommendationEnd()}
+      </div>
+    </section>
+  `;
+}
+
+function renderEmergencyWallState() {
+  return `
+    <section class="recommendation-page" aria-label="问答墙状态">
+      <div class="recommendation-content">
+        <section class="single-note-viewer recommendation-end-viewer" aria-label="问答墙暂时关闭">
+          <div class="single-note-stage">
+            <div class="recommendation-end" role="status">
+              <span class="recommendation-end-icon" aria-hidden="true">${icon("shield-alert")}</span>
+              <div>
+                <p class="page-kicker">问答墙</p>
+                <h1>问答墙暂时关闭</h1>
+                <p>${escapeHtml(runtimeMessage("恢复开放后会自动重新加载。"))}</p>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
     </section>
   `;
