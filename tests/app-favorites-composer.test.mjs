@@ -244,7 +244,32 @@ test("landing uses the approved campaign artwork and concise mobile choices", ()
   assert.match(html, /留一个问题/);
   assert.match(html, /回答一张便签/);
   assert.match(html, /下滑先看看/);
+  assert.match(html, /<p class="landing-browse"/);
+  assert.doesNotMatch(html, /data-action="landing-browse"/);
   assert.doesNotMatch(html, /把一个问题，交给另一代/);
+});
+
+test("the completed wall shows a replay prompt and keeps downward swipe history", () => {
+  const { sandbox } = createHarness();
+  vm.runInContext(
+    `ui.route = "wall";
+     ui.recommendationIds = ["note-01", "note-02"];
+     ui.recommendationIndex = 1;
+     ui.recommendationComplete = true;
+     touchGestureStart = { kind: "viewer", x: 120, y: 120, axis: "y", startedAt: 900 };
+     handleTouchEnd({ changedTouches: [{ clientX: 120, clientY: 190 }], cancelable: true, preventDefault() {} });`,
+    sandbox,
+  );
+
+  assert.equal(vm.runInContext("ui.recommendationComplete", sandbox), false);
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 1);
+
+  vm.runInContext("ui.recommendationComplete = true", sandbox);
+  const endHtml = vm.runInContext("renderRecommendationEnd()", sandbox);
+  assert.match(endHtml, /assets\/ending-duck\.gif/);
+  assert.match(endHtml, /哎鸭，被你看完啦/);
+  assert.match(endHtml, /下滑回看上一张/);
+  assert.doesNotMatch(endHtml, /推荐/);
 });
 
 test("the photographed note wall remains visible behind every route", () => {
@@ -283,6 +308,7 @@ test("approved raster assets retain their original bytes", async () => {
     ["wall-scene.png", "c0ed35231c52e3e603c879bf63c825b8edfa07c00dcb617ee7671f75be75d2c7"],
     ["hero-overlay.png", "8b47fd1c190d7db8d0ae434128aac29437446a99661279e773866507e7eaaeae"],
     ["landing-duck.png", "5e0d841a22301c4b4618cae8fc386253c851872519ba7577fbbe6b333d169998"],
+    ["ending-duck.gif", "d7c0ec9216f0598ceab52c47babe675b8467bb6f30e34810871b7f5213ad75d8"],
   ]);
 
   for (const [name, digest] of expected) {
@@ -301,7 +327,8 @@ test("a remembered completed feed does not claim that the public wall is empty",
     sandbox,
   );
 
-  assert.match(completedHtml, /这一批便签看完了/);
+  assert.match(completedHtml, /哎鸭，被你看完啦/);
+  assert.match(completedHtml, /assets\/ending-duck\.gif/);
   assert.doesNotMatch(completedHtml, /暂时没有公开便签/);
 });
 

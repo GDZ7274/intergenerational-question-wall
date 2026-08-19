@@ -2678,27 +2678,13 @@ h1 {
   width: min(100%, 620px);
   height: min(100%, 690px);
   min-height: 0;
-  grid-template-rows: 32px minmax(0, 1fr) 42px;
+  grid-template-rows: minmax(0, 1fr) 44px;
   margin: 0 auto;
 }
 
 .recommendation-content .single-note-viewer-head {
   justify-content: center;
   margin: 0;
-}
-
-.recommendation-label {
-  display: inline-flex;
-  align-items: center;
-  color: rgba(23, 32, 28, 0.72);
-  font-size: 12px;
-  font-weight: 750;
-  gap: 6px;
-}
-
-.recommendation-label svg {
-  width: 15px;
-  height: 15px;
 }
 
 .recommendation-content .single-note-stage {
@@ -2841,7 +2827,7 @@ h1 {
   .recommendation-content .single-note-viewer {
     width: 100%;
     height: 100%;
-    grid-template-rows: 28px minmax(0, 1fr) 44px;
+    grid-template-rows: minmax(0, 1fr) 44px;
   }
 
   .recommendation-content .single-note-stage {
@@ -2980,15 +2966,6 @@ body {
 .landing-footnote {
   color: rgba(23, 32, 28, 0.76);
   text-shadow: 0 1px 8px rgba(255, 255, 255, 0.92);
-}
-
-.recommendation-label {
-  min-height: 28px;
-  padding: 4px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.58);
-  border-radius: 999px;
-  background: rgba(255, 255, 252, 0.58);
-  box-shadow: 0 3px 12px rgba(23, 32, 28, 0.08);
 }
 
 .single-note-gesture-hint:not(.single-note-gesture-hint-quiet) {
@@ -4197,5 +4174,100 @@ body.is-opening .site-background {
   .site-frost,
   body.is-immersive-route .site-frost {
     background: rgba(247, 244, 239, 0.84);
+  }
+}
+
+/* End-of-wall replay prompt and gesture-only landing browse */
+.landing-browse {
+  pointer-events: none;
+  user-select: none;
+  cursor: default;
+}
+
+.recommendation-content .single-note-stage {
+  touch-action: none;
+}
+
+.recommendation-end-scene {
+  display: grid;
+  width: min(100%, 360px);
+  justify-items: center;
+  align-content: center;
+  text-align: center;
+}
+
+.recommendation-end-gif {
+  display: block;
+  width: min(42vw, 160px);
+  height: auto;
+  aspect-ratio: 1;
+  object-fit: contain;
+  margin: 0 auto -18px;
+  filter: drop-shadow(0 10px 12px rgba(52, 42, 28, 0.16));
+}
+
+.recommendation-end-dialog {
+  position: relative;
+  width: min(100%, 320px);
+  padding: 20px 22px 18px;
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  border-radius: 18px 18px 18px 7px;
+  color: #21382b;
+  background: #ffffff;
+  box-shadow: 0 16px 34px rgba(45, 37, 25, 0.18);
+}
+
+.recommendation-end-dialog::after {
+  position: absolute;
+  bottom: -11px;
+  left: 30px;
+  width: 20px;
+  height: 20px;
+  border-right: 1px solid rgba(255, 255, 255, 0.92);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.92);
+  background: #ffffff;
+  content: "";
+  transform: rotate(45deg);
+}
+
+.recommendation-end-kicker {
+  margin: 0 0 6px;
+  color: #55715f;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.recommendation-end-dialog h1 {
+  margin: 0 0 8px;
+  color: #21382b;
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.recommendation-end-dialog p:last-child {
+  margin: 0;
+  color: #627469;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.recommendation-end-viewer .single-note-viewer-foot {
+  justify-content: center;
+}
+
+@media (max-width: 600px) {
+  .recommendation-end-gif {
+    width: min(42vw, 142px);
+    margin-bottom: -14px;
+  }
+
+  .recommendation-end-dialog {
+    width: min(calc(100vw - 40px), 320px);
+    padding: 18px 18px 16px;
+  }
+
+  .recommendation-end-dialog h1 {
+    font-size: 22px;
   }
 }

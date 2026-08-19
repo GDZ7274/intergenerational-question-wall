@@ -1277,15 +1277,15 @@ function renderLandingPage() {
             </button>
             <button class="landing-action landing-action-answer" type="button" data-action="landing-answer"${submissionsAreDisabled() ? " disabled" : ""}>
               <span class="landing-action-icon">${icon("pen-line")}</span>
-              <span class="landing-action-copy"><strong>回答一张便签</strong><small>从推荐内容开始</small></span>
+              <span class="landing-action-copy"><strong>回答一张便签</strong><small>从墙上的便签开始</small></span>
               ${icon("chevron-right")}
             </button>
           </div>
 
-          <button class="landing-browse" type="button" data-action="landing-browse" aria-label="下滑先看看，也可以轻点进入">
+          <p class="landing-browse" aria-label="下滑先看看">
             <span class="landing-browse-icon" aria-hidden="true">${icon("chevrons-down")}</span>
             <span>下滑先看看</span>
-          </button>
+          </p>
         </div>
       </div>
     </section>
@@ -1395,7 +1395,7 @@ function renderRecommendationPage() {
   }
   const note = ui.recommendationComplete ? null : getCurrentRecommendation();
   return `
-    <section class="recommendation-page" aria-label="推荐问答">
+    <section class="recommendation-page" aria-label="问答墙">
       ${renderCampaignHero({ canExit: true })}
       <div class="recommendation-content">
         ${note ? renderSingleNoteViewer(note) : renderRecommendationEnd()}
@@ -1452,9 +1452,6 @@ function renderSingleNoteViewer(note) {
   const canGoBack = ui.recommendationIndex > 0;
   return `
     <section class="single-note-viewer feed-motion-${ui.feedMotion}" aria-label="单张便签浏览">
-      <div class="single-note-viewer-head">
-        <span class="recommendation-label">${icon("sparkles")} 推荐</span>
-      </div>
       <div class="single-note-stage">
         <button class="single-note-nav single-note-nav-prev" type="button" data-action="wall-prev" aria-label="上一张便签"${canGoBack ? "" : " disabled"}>
           ${icon("chevron-up")}
@@ -1571,30 +1568,41 @@ function renderNoteQuickActions(note, context = "feed") {
 function renderRecommendationEnd() {
   const canGoBack = ui.recommendationIds.length > 0;
   const completedBatch = canGoBack || getAvailableNotes().length > 0;
+  const endContent = completedBatch
+    ? `
+        <div class="recommendation-end-scene" role="status">
+          <img class="recommendation-end-gif" src="assets/ending-duck.gif" alt="" aria-hidden="true" />
+          <div class="recommendation-end-dialog">
+            <p class="recommendation-end-kicker">看完啦</p>
+            <h1>哎鸭，被你看完啦</h1>
+            <p>下滑回看刚刚的便签</p>
+          </div>
+        </div>
+      `
+    : `
+        <div class="recommendation-end recommendation-end-empty" role="status">
+          <span class="recommendation-end-icon" aria-hidden="true">${icon("clock-3")}</span>
+          <div>
+            <p class="page-kicker">便签正在路上</p>
+            <h1>暂时没有公开便签</h1>
+            <p>新的问答通过审核后会出现在这里。</p>
+          </div>
+        </div>
+      `;
   return `
-    <section class="single-note-viewer recommendation-end-viewer feed-motion-${ui.feedMotion}" aria-label="推荐结束">
-      <div class="single-note-viewer-head">
-        <span class="recommendation-label">${icon("sparkles")} 推荐</span>
-      </div>
+    <section class="single-note-viewer recommendation-end-viewer feed-motion-${ui.feedMotion}" aria-label="便签浏览结束">
       <div class="single-note-stage">
         <button class="single-note-nav single-note-nav-prev" type="button" data-action="wall-prev" aria-label="上一张便签"${canGoBack ? "" : " disabled"}>
           ${icon("chevron-up")}
         </button>
-        <div class="recommendation-end" role="status">
-          <span class="recommendation-end-icon" aria-hidden="true">${icon(completedBatch ? "check" : "clock-3")}</span>
-          <div>
-            <p class="page-kicker">${completedBatch ? "已经看到这里" : "便签正在路上"}</p>
-            <h1>${completedBatch ? "这一批便签看完了" : "暂时没有公开便签"}</h1>
-            <p>${completedBatch ? "有新便签时，推荐会从这里继续。" : "新的问答通过审核后会出现在这里。"}</p>
-          </div>
-        </div>
+        ${endContent}
       </div>
       <div class="single-note-viewer-foot">
         ${
           canGoBack
             ? `<span class="single-note-gesture-hint">
                 <span class="single-note-gesture-icon" aria-hidden="true">↓</span>
-                下滑回看
+                下滑回看上一张
               </span>`
             : ""
         }
@@ -2401,8 +2409,6 @@ function handleClick(event) {
     startAsk();
   } else if (action === "landing-answer") {
     startAnswer();
-  } else if (action === "landing-browse") {
-    navigate("wall");
   } else if (action === "landing-return") {
     navigate("home");
   } else if (action === "wall-prev") {
