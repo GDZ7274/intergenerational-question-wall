@@ -90,6 +90,17 @@ function createHarness({
     localStorage.setItem(storageKey, JSON.stringify(persistedState));
   }
   const sessionStorage = providedSessionStorage || createStorage();
+  const createdObjectUrls = [];
+  const revokedObjectUrls = [];
+  class TestURL extends URL {}
+  TestURL.createObjectURL = (blob) => {
+    const url = `blob:share-preview-${createdObjectUrls.length + 1}`;
+    createdObjectUrls.push({ blob, url });
+    return url;
+  };
+  TestURL.revokeObjectURL = (url) => {
+    revokedObjectUrls.push(url);
+  };
   const app = createElement("app");
   const dialog = createElement("note-dialog");
   const dialogContent = createElement("note-dialog-content");
@@ -156,7 +167,7 @@ function createHarness({
     navigator,
     location,
     history,
-    URL,
+    URL: TestURL,
     performance: { now: () => 1000 },
     crypto: { randomUUID: () => "session-12345678" },
     console: { error() {}, warn() {} },
@@ -188,6 +199,8 @@ function createHarness({
     document,
     localStorage,
     sessionStorage,
+    createdObjectUrls,
+    revokedObjectUrls,
   };
 }
 
@@ -328,7 +341,7 @@ test("landing uses the approved campaign artwork and concise mobile choices", ()
   assert.doesNotMatch(html, /把一个问题，交给另一代/);
 });
 
-test("the completed wall shows a replay prompt and keeps downward swipe history", () => {
+test("the completed wall shows a replay prompt and keeps upward page-swipe history", () => {
   const { sandbox } = createHarness();
   vm.runInContext(
     `ui.route = "wall";
@@ -347,7 +360,7 @@ test("the completed wall shows a replay prompt and keeps downward swipe history"
   const endHtml = vm.runInContext("renderRecommendationEnd()", sandbox);
   assert.match(endHtml, /assets\/ending-duck\.gif/);
   assert.match(endHtml, /哎鸭，被你看完啦/);
-  assert.match(endHtml, /下滑回看上一张/);
+  assert.match(endHtml, /上滑回看上一张/);
   assert.doesNotMatch(endHtml, /recommendation-end-kicker/);
   assert.doesNotMatch(endHtml, /推荐/);
 });
@@ -372,7 +385,7 @@ test("ordered viewed history survives a reload and restores the last public note
     reloaded.sandbox,
   );
 
-  assert.match(endHtml, /下滑回看上一张/);
+  assert.match(endHtml, /上滑回看上一张/);
   vm.runInContext("moveWall(-1)", reloaded.sandbox);
   assert.equal(vm.runInContext("ui.recommendationComplete", reloaded.sandbox), false);
   assert.equal(
@@ -401,7 +414,7 @@ test("replay history filters removed notes after remote content refresh", async 
 
   await vm.runInContext("refreshRemoteContent({ resetRecommendations: true })", reloaded.sandbox);
   const endHtml = vm.runInContext("renderRecommendationPage()", reloaded.sandbox);
-  assert.match(endHtml, /下滑回看上一张/);
+  assert.match(endHtml, /上滑回看上一张/);
 
   vm.runInContext("moveWall(-1)", reloaded.sandbox);
   assert.equal(vm.runInContext("getCurrentRecommendation().id", reloaded.sandbox), survivingNote.id);
@@ -445,10 +458,28 @@ test("the photographed note wall remains visible behind every route", () => {
   assert.match(stylesSource, /body\.is-opening \.site-background \{[\s\S]*?scale\(1\.01\)/);
 });
 
-test("a downward landing swipe enters the one-note wall", () => {
+test("a downward page swipe from bottom to top enters the one-note wall", () => {
   const { sandbox } = createHarness();
   sandbox.__touchEndEvent = {
-    changedTouches: [{ clientX: 120, clientY: 180 }],
+    changedTouches: [{ clientX: 120, clientY: 110 }],
+    cancelable: true,
+    preventDefault() {},
+  };
+
+  vm.runInContext(
+    `ui.route = "home";
+     touchGestureStart = { kind: "landing", x: 120, y: 180, axis: "y", startedAt: 900 };
+     handleTouchEnd(__touchEndEvent);`,
+    sandbox,
+  );
+
+  assert.equal(vm.runInContext("ui.route", sandbox), "wall");
+});
+
+test("an upward page swipe from top to bottom does not enter the wall from landing", () => {
+  const { sandbox } = createHarness();
+  sandbox.__touchEndEvent = {
+    changedTouches: [{ clientX: 120, clientY: 190 }],
     cancelable: true,
     preventDefault() {},
   };
@@ -460,7 +491,85 @@ test("a downward landing swipe enters the one-note wall", () => {
     sandbox,
   );
 
-  assert.equal(vm.runInContext("ui.route", sandbox), "wall");
+  assert.equal(vm.runInContext("ui.route", sandbox), "home");
+});
+
+test("wall touch gestures map bottom-to-top to next and top-to-bottom to previous", () => {
+  const { sandbox } = createHarness();
+  vm.runInContext(
+    `ui.route = "wall";
+     ui.recommendationIds = ["note-01", "note-02"];
+     ui.recommendationIndex = 0;
+     ui.recommendationComplete = false;
+     touchGestureStart = { kind: "viewer", x: 120, y: 190, axis: "y", startedAt: 900 };
+     handleTouchEnd({
+       changedTouches: [{ clientX: 120, clientY: 110 }],
+       cancelable: true,
+       preventDefault() {},
+     });`,
+    sandbox,
+  );
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 1);
+
+  vm.runInContext(
+    `touchGestureStart = { kind: "viewer", x: 120, y: 110, axis: "y", startedAt: 900 };
+     handleTouchEnd({
+       changedTouches: [{ clientX: 120, clientY: 190 }],
+       cancelable: true,
+       preventDefault() {},
+     });`,
+    sandbox,
+  );
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 0);
+
+  const viewerHtml = vm.runInContext(
+    "ui.showSwipeHint = true; renderSingleNoteViewer(seedNotes[0])",
+    sandbox,
+  );
+  assert.match(viewerHtml, /下滑继续/);
+});
+
+test("wheel and keyboard page directions select the matching next or previous note", () => {
+  const { sandbox } = createHarness();
+  vm.runInContext(
+    `ui.route = "wall";
+     ui.recommendationIds = ["note-01", "note-02"];
+     ui.recommendationIndex = 0;
+     ui.recommendationComplete = false;
+     wheelGestureReadyAt = 0;
+     handleWheel({
+       deltaY: 80,
+       cancelable: true,
+       preventDefault() {},
+       target: { closest(selector) { return selector === ".recommendation-page" ? this : null; } },
+     });`,
+    sandbox,
+  );
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 1);
+
+  vm.runInContext(
+    `wheelGestureReadyAt = 0;
+     handleWheel({
+       deltaY: -80,
+       cancelable: true,
+       preventDefault() {},
+       target: { closest(selector) { return selector === ".recommendation-page" ? this : null; } },
+     });`,
+    sandbox,
+  );
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 0);
+
+  vm.runInContext(
+    `handleKeydown({ key: "ArrowDown", preventDefault() {} });`,
+    sandbox,
+  );
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 1);
+
+  vm.runInContext(
+    `handleKeydown({ key: "ArrowUp", preventDefault() {} });`,
+    sandbox,
+  );
+  assert.equal(vm.runInContext("ui.recommendationIndex", sandbox), 0);
 });
 
 test("mobile nav opens the lightweight Q&A sheet before asking for a role", () => {
@@ -680,6 +789,7 @@ test("the explicit share sheet offers three clear actions and the first image ac
   assert.match(shareDialogContent.innerHTML, /分享便签图片/);
   assert.match(shareDialogContent.innerHTML, /保存图片/);
   assert.match(shareDialogContent.innerHTML, /复制链接/);
+  assert.match(shareDialogContent.innerHTML, /正在准备图片预览/);
 
   await vm.runInContext('noteSharePreparationPromises.get("note-01")', sandbox);
   await Promise.resolve();
@@ -699,6 +809,38 @@ test("the explicit share sheet offers three clear actions and the first image ac
 
   assert.equal(shareCalls.length, 1, "one action click should immediately open native sharing");
   assert.doesNotMatch(toast.textContent, /再点一次/);
+});
+
+test("the share sheet previews the prepared image without rendering it twice and revokes it on close", async () => {
+  const { sandbox, shareDialogContent, createdObjectUrls, revokedObjectUrls } = createHarness();
+  sandbox.__previewImageBlob = { type: "image/png", marker: "preview-image" };
+  vm.runInContext(
+    `globalThis.__previewRenderCalls = 0;
+     createNoteImageBlob = async () => {
+       globalThis.__previewRenderCalls += 1;
+       return __previewImageBlob;
+     };`,
+    sandbox,
+  );
+
+  vm.runInContext('openShareSheet("note-01")', sandbox);
+  await vm.runInContext('noteSharePreparationPromises.get("note-01")', sandbox);
+  await Promise.resolve();
+
+  assert.match(shareDialogContent.innerHTML, /即将分享或保存的便签图片预览/);
+  assert.match(shareDialogContent.innerHTML, /src="blob:share-preview-1"/);
+  assert.match(shareDialogContent.innerHTML, /保存前预览/);
+  assert.equal(vm.runInContext("globalThis.__previewRenderCalls", sandbox), 1);
+  assert.equal(createdObjectUrls.length, 1);
+  assert.equal(createdObjectUrls[0].blob, sandbox.__previewImageBlob);
+
+  vm.runInContext('refreshShareSheet("note-01", "ready")', sandbox);
+  assert.equal(vm.runInContext("globalThis.__previewRenderCalls", sandbox), 1);
+  assert.equal(createdObjectUrls.length, 1, "the same cached Blob URL should be reused");
+
+  vm.runInContext("closeShareSheet()", sandbox);
+  assert.deepEqual(revokedObjectUrls, ["blob:share-preview-1"]);
+  assert.equal(vm.runInContext("sharePreviewObjectUrl", sandbox), "");
 });
 
 test("save image and copy link actions each complete in one selection", async () => {

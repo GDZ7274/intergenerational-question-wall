@@ -276,6 +276,8 @@ let runtimeSyncPromise = null;
 let runtimePollTimer = null;
 let landingOpeningTimer = null;
 let wheelGestureReadyAt = 0;
+let sharePreviewObjectUrl = "";
+let sharePreviewBlob = null;
 
 document.addEventListener("DOMContentLoaded", async () => {
   app.addEventListener("click", handleClick);
@@ -1766,7 +1768,7 @@ function renderSingleNoteViewer(note) {
           ui.showSwipeHint
             ? `<span class="single-note-gesture-hint">
                 <span class="single-note-gesture-icon" aria-hidden="true">↑</span>
-                上滑继续
+                下滑继续
               </span>`
             : `<span class="single-note-gesture-hint single-note-gesture-hint-quiet" aria-hidden="true">
                 <span class="single-note-gesture-icon">↑</span>
@@ -1901,7 +1903,7 @@ function renderRecommendationEnd() {
           <img class="recommendation-end-gif" src="assets/ending-duck.gif" alt="" aria-hidden="true" />
           <div class="recommendation-end-dialog">
             <h1>哎鸭，被你看完啦</h1>
-            ${canGoBack ? "<p>下滑回看刚刚的便签</p>" : "<p>新便签通过审核后会继续出现在这里</p>"}
+            ${canGoBack ? "<p>上滑回看刚刚的便签</p>" : "<p>新便签通过审核后会继续出现在这里</p>"}
           </div>
         </div>
       `
@@ -1928,7 +1930,7 @@ function renderRecommendationEnd() {
           canGoBack
             ? `<span class="single-note-gesture-hint">
                 <span class="single-note-gesture-icon" aria-hidden="true">↓</span>
-                下滑回看上一张
+                上滑回看上一张
               </span>`
             : ""
         }
@@ -3041,7 +3043,7 @@ function handleTouchEnd(event) {
   const verticalSwipe = hasVerticalIntent && (hasSwipeDistance || isFastVerticalFlick);
 
   if (start.kind === "landing") {
-    if (dy > 0 && verticalSwipe) {
+    if (dy < 0 && verticalSwipe) {
       if (event.cancelable) event.preventDefault();
       suppressClickUntil = performance.now() + 450;
       navigate("wall");
@@ -3759,6 +3761,7 @@ function refreshShareSheet(noteId, preparationStatus = "") {
   if (!shareDialogContent) return;
   const note = findViewableNote(noteId);
   if (!note) {
+    clearShareSheetPreview();
     shareDialogContent.innerHTML = `
       <div class="action-sheet-handle" aria-hidden="true"></div>
       <div class="action-sheet-head">
@@ -3772,6 +3775,7 @@ function refreshShareSheet(noteId, preparationStatus = "") {
 
   const cached = getPreparedNoteShareImage(note);
   const imageReady = Boolean(cached?.blob);
+  const previewUrl = imageReady ? getShareSheetPreviewUrl(cached.blob) : getShareSheetPreviewUrl(null);
   const imageFailed = preparationStatus === "ready" && cached && !cached.blob;
   const isPhoto = note.kind === "photo";
   const imageStatus = imageReady
@@ -3790,6 +3794,17 @@ function refreshShareSheet(noteId, preparationStatus = "") {
         <p class="share-sheet-status${imageFailed ? " is-error" : ""}">${escapeHtml(imageStatus)}</p>
       </div>
       <button class="action-sheet-close" type="button" data-share-action="close" aria-label="关闭分享菜单">${icon("x")}</button>
+    </div>
+    <div class="share-sheet-preview"${imageReady ? " data-ready=\"true\"" : ""} aria-live="polite">
+      ${
+        previewUrl
+          ? `<img src="${escapeHtml(previewUrl)}" alt="即将分享或保存的便签图片预览" />
+             <span class="share-sheet-preview-label">保存前预览</span>`
+          : `<div class="share-sheet-preview-placeholder">
+              ${icon(imageFailed ? "image-off" : "loader-circle")}
+              <span>${escapeHtml(imageFailed ? "暂时无法显示图片预览" : "正在准备图片预览…")}</span>
+            </div>`
+      }
     </div>
     <div class="action-sheet-options share-sheet-options">
       <button class="action-sheet-option" type="button" data-share-action="share-image"${imageReady ? "" : " disabled"}>
@@ -3812,9 +3827,42 @@ function refreshShareSheet(noteId, preparationStatus = "") {
   refreshIcons();
 }
 
+function clearShareSheetPreview() {
+  if (sharePreviewObjectUrl && typeof URL.revokeObjectURL === "function") {
+    try {
+      URL.revokeObjectURL(sharePreviewObjectUrl);
+    } catch {
+      // Closing the sheet must remain safe when a browser rejects Blob URL cleanup.
+    }
+  }
+  sharePreviewObjectUrl = "";
+  sharePreviewBlob = null;
+}
+
+function getShareSheetPreviewUrl(blob) {
+  if (!blob) {
+    clearShareSheetPreview();
+    return "";
+  }
+  if (sharePreviewBlob === blob && sharePreviewObjectUrl) return sharePreviewObjectUrl;
+
+  clearShareSheetPreview();
+  if (typeof URL.createObjectURL !== "function") return "";
+  try {
+    sharePreviewObjectUrl = URL.createObjectURL(blob);
+    sharePreviewBlob = blob;
+    return sharePreviewObjectUrl;
+  } catch {
+    sharePreviewObjectUrl = "";
+    sharePreviewBlob = null;
+    return "";
+  }
+}
+
 function closeShareSheet() {
   if (shareDialog?.open) shareDialog.close();
   if (shareDialog?.dataset) delete shareDialog.dataset.noteId;
+  clearShareSheetPreview();
 }
 
 function handleShareDialogCancel(event) {
