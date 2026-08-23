@@ -6,6 +6,7 @@ import vm from "node:vm";
 
 const appSource = await readFile(new URL("../prototype/app.js", import.meta.url), "utf8");
 const stylesSource = await readFile(new URL("../prototype/styles.css", import.meta.url), "utf8");
+const indexSource = await readFile(new URL("../prototype/index.html", import.meta.url), "utf8");
 
 function createClassList() {
   const values = new Set();
@@ -34,11 +35,19 @@ function createElement(id) {
     innerHTML: "",
     textContent: "",
     open: false,
+    scrollTop: 0,
+    dataset: {},
     classList: createClassList(),
     addEventListener() {},
+    appendChild() {},
+    click() {},
     close() {
       this.open = false;
     },
+    showModal() {
+      this.open = true;
+    },
+    remove() {},
     focus() {},
     querySelector() {
       return null;
@@ -61,25 +70,47 @@ function createStorage(initial = {}) {
   };
 }
 
-function createHarness({ persistedState, share, canShare, backend } = {}) {
+function createHarness({
+  persistedState,
+  share,
+  canShare,
+  backend,
+  localStorage: providedLocalStorage,
+  sessionStorage: providedSessionStorage,
+  cookie = "",
+  href = "https://example.test/prototype/?from=test#wall",
+  hash = "#wall",
+  writeText,
+} = {}) {
   const storageKey = "question-wall-prototype-v1";
-  const localStorage = createStorage(
+  const localStorage = providedLocalStorage || createStorage(
     persistedState ? { [storageKey]: JSON.stringify(persistedState) } : {},
   );
-  const sessionStorage = createStorage();
+  if (providedLocalStorage && persistedState) {
+    localStorage.setItem(storageKey, JSON.stringify(persistedState));
+  }
+  const sessionStorage = providedSessionStorage || createStorage();
   const app = createElement("app");
   const dialog = createElement("note-dialog");
   const dialogContent = createElement("note-dialog-content");
+  const participationDialog = createElement("participation-dialog");
+  const participationDialogContent = createElement("participation-dialog-content");
+  const shareDialog = createElement("share-dialog");
+  const shareDialogContent = createElement("share-dialog-content");
   const toast = createElement("toast");
   const elements = new Map([
     ["app", app],
     ["note-dialog", dialog],
     ["note-dialog-content", dialogContent],
+    ["participation-dialog", participationDialog],
+    ["participation-dialog-content", participationDialogContent],
+    ["share-dialog", shareDialog],
+    ["share-dialog-content", shareDialogContent],
     ["toast", toast],
   ]);
   const location = {
-    href: "https://example.test/prototype/?from=test#wall",
-    hash: "#wall",
+    href,
+    hash,
   };
   const history = {
     state: null,
@@ -94,10 +125,10 @@ function createHarness({ persistedState, share, canShare, backend } = {}) {
     back() {},
   };
   const document = {
-    cookie: "",
+    cookie,
     visibilityState: "visible",
     activeElement: null,
-    body: { appendChild() {} },
+    body: { appendChild() {}, classList: createClassList() },
     getElementById(id) {
       return elements.get(id) || null;
     },
@@ -113,7 +144,7 @@ function createHarness({ persistedState, share, canShare, backend } = {}) {
     },
   };
   const navigator = {
-    clipboard: { async writeText() {} },
+    clipboard: { writeText: writeText || (async () => {}) },
     ...(share ? { share } : {}),
     ...(canShare ? { canShare } : {}),
   };
@@ -144,7 +175,20 @@ function createHarness({ persistedState, share, canShare, backend } = {}) {
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(appSource, sandbox);
-  return { sandbox, app, toast };
+  return {
+    sandbox,
+    app,
+    dialog,
+    dialogContent,
+    participationDialog,
+    participationDialogContent,
+    shareDialog,
+    shareDialogContent,
+    toast,
+    document,
+    localStorage,
+    sessionStorage,
+  };
 }
 
 function evaluateJson(sandbox, expression) {
@@ -161,6 +205,41 @@ function assertTextareaInsideComposer(html, textareaId) {
   assert.ok(composerEnd > textareaStart, "textarea should close before the composer note");
   assert.match(html.slice(textareaStart, composerEnd), new RegExp(`id="${textareaId}"`));
 }
+
+test("brand and adult role wording change at the presentation layer only", () => {
+  const { sandbox } = createHarness({
+    persistedState: {
+      role: "adult",
+      favorites: [],
+      myQuestions: [],
+      myAnswers: [],
+      notifications: [],
+      drafts: { ask: { adult: "", child: "" }, answer: {} },
+    },
+  });
+
+  assert.match(indexSource, /<title>【躺倒鸭】解鸭留言墙<\/title>/);
+  assert.match(indexSource, /property="og:title"\s+content="【躺倒鸭】解鸭留言墙"/);
+  assert.match(indexSource, /name="twitter:title"\s+content="【躺倒鸭】解鸭留言墙"/);
+  assert.equal(vm.runInContext("persisted.role", sandbox), "adult");
+  assert.equal(vm.runInContext('roleName("adult")', sandbox), "大朋友");
+  assert.equal(vm.runInContext('directionMeta("adult_to_child").label', sandbox), "大朋友问 → 小朋友答");
+  assert.equal(
+    vm.runInContext("seedNotes[0].question", sandbox),
+    "如果大人也要上一节课，你最想教他们什么？",
+    "question copy authored with 大人 must not be mechanically rewritten",
+  );
+
+  const topbarHtml = vm.runInContext("renderTopbar()", sandbox);
+  const identityHtml = vm.runInContext("renderIdentityPage()", sandbox);
+  assert.match(topbarHtml, /<span class="brand-name">解鸭留言墙<\/span>/);
+  assert.match(identityHtml, /我是大朋友/);
+  assert.doesNotMatch(identityHtml, /我是大人/);
+  assert.match(
+    vm.runInContext("noteImageFilename(seedNotes[0])", sandbox),
+    /^解鸭留言墙-.*\.png$/,
+  );
+});
 
 test("question and answer forms edit directly inside the note without preview sections", () => {
   const { sandbox } = createHarness();
@@ -273,6 +352,86 @@ test("the completed wall shows a replay prompt and keeps downward swipe history"
   assert.doesNotMatch(endHtml, /推荐/);
 });
 
+test("ordered viewed history survives a reload and restores the last public note", () => {
+  const sharedLocalStorage = createStorage();
+  const firstVisit = createHarness({ localStorage: sharedLocalStorage });
+  const noteCount = vm.runInContext("seedNotes.length", firstVisit.sandbox);
+
+  vm.runInContext("getCurrentRecommendation()", firstVisit.sandbox);
+  for (let index = 0; index < noteCount; index += 1) {
+    vm.runInContext("moveWall(1)", firstVisit.sandbox);
+  }
+  assert.equal(vm.runInContext("ui.recommendationComplete", firstVisit.sandbox), true);
+
+  const reloaded = createHarness({
+    localStorage: sharedLocalStorage,
+    cookie: firstVisit.document.cookie,
+  });
+  const endHtml = vm.runInContext(
+    "restoreRecentViewedHistory(); renderRecommendationPage()",
+    reloaded.sandbox,
+  );
+
+  assert.match(endHtml, /下滑回看上一张/);
+  vm.runInContext("moveWall(-1)", reloaded.sandbox);
+  assert.equal(vm.runInContext("ui.recommendationComplete", reloaded.sandbox), false);
+  assert.equal(
+    vm.runInContext("getCurrentRecommendation().id", reloaded.sandbox),
+    `note-${String(noteCount).padStart(2, "0")}`,
+  );
+});
+
+test("replay history filters removed notes after remote content refresh", async () => {
+  const sharedLocalStorage = createStorage();
+  const firstVisit = createHarness({ localStorage: sharedLocalStorage });
+
+  vm.runInContext("getCurrentRecommendation(); moveWall(1)", firstVisit.sandbox);
+  const survivingNote = evaluateJson(firstVisit.sandbox, "seedNotes[0]");
+  const reloaded = createHarness({
+    localStorage: sharedLocalStorage,
+    cookie: firstVisit.document.cookie,
+    backend: {
+      enabled: true,
+      experienceMode: false,
+      async loadContent() {
+        return { notes: [survivingNote], questions: [] };
+      },
+    },
+  });
+
+  await vm.runInContext("refreshRemoteContent({ resetRecommendations: true })", reloaded.sandbox);
+  const endHtml = vm.runInContext("renderRecommendationPage()", reloaded.sandbox);
+  assert.match(endHtml, /下滑回看上一张/);
+
+  vm.runInContext("moveWall(-1)", reloaded.sandbox);
+  assert.equal(vm.runInContext("getCurrentRecommendation().id", reloaded.sandbox), survivingNote.id);
+  assert.deepEqual(evaluateJson(reloaded.sandbox, "ui.recommendationIds"), [survivingNote.id]);
+});
+
+test("ordered replay history stays independent from the cookie no-repeat set", () => {
+  const sharedLocalStorage = createStorage();
+  const firstVisit = createHarness({ localStorage: sharedLocalStorage });
+  const noteCount = vm.runInContext("seedNotes.length", firstVisit.sandbox);
+
+  vm.runInContext("getCurrentRecommendation()", firstVisit.sandbox);
+  for (let index = 0; index < noteCount; index += 1) {
+    vm.runInContext("moveWall(1)", firstVisit.sandbox);
+  }
+
+  const historyWithoutCookie = createHarness({ localStorage: sharedLocalStorage });
+  assert.equal(
+    vm.runInContext("peekNextRecommendation().id", historyWithoutCookie.sandbox),
+    "note-01",
+    "local replay history must not itself suppress recommendations",
+  );
+
+  const cookieWithoutHistory = createHarness({ cookie: firstVisit.document.cookie });
+  const endHtml = vm.runInContext("renderRecommendationPage()", cookieWithoutHistory.sandbox);
+  assert.match(endHtml, /哎鸭，被你看完啦/);
+  assert.doesNotMatch(endHtml, /回看/);
+  assert.deepEqual(evaluateJson(cookieWithoutHistory.sandbox, "ui.recommendationIds"), []);
+});
+
 test("the photographed note wall remains visible behind every route", () => {
   assert.match(
     stylesSource,
@@ -302,6 +461,75 @@ test("a downward landing swipe enters the one-note wall", () => {
   );
 
   assert.equal(vm.runInContext("ui.route", sandbox), "wall");
+});
+
+test("mobile nav opens the lightweight Q&A sheet before asking for a role", () => {
+  const { sandbox, participationDialog, participationDialogContent } = createHarness();
+  const navHtml = vm.runInContext("renderMobileNav()", sandbox);
+
+  assert.match(navHtml, />墙</);
+  assert.match(navHtml, />问答</);
+  assert.match(navHtml, />我的</);
+  assert.doesNotMatch(navHtml, />参与</);
+
+  sandbox.__openParticipationEvent = {
+    preventDefault() {},
+    target: {
+      closest() {
+        return { dataset: { action: "open-participation" } };
+      },
+    },
+  };
+  vm.runInContext("ui.route = 'wall'; handleClick(__openParticipationEvent)", sandbox);
+
+  assert.equal(participationDialog.open, true);
+  assert.match(participationDialogContent.innerHTML, /提个问题/);
+  assert.match(participationDialogContent.innerHTML, /去回答/);
+  assert.equal(vm.runInContext("ui.route", sandbox), "wall");
+  assert.equal(vm.runInContext("ui.pendingIntent", sandbox), null);
+
+  sandbox.__askFromSheetEvent = {
+    target: {
+      closest() {
+        return { dataset: { participationAction: "ask" } };
+      },
+    },
+  };
+  vm.runInContext("handleParticipationDialogClick(__askFromSheetEvent)", sandbox);
+
+  assert.equal(participationDialog.open, false);
+  assert.equal(vm.runInContext("ui.route", sandbox), "identity");
+  assert.deepEqual(evaluateJson(sandbox, "ui.pendingIntent"), { type: "ask" });
+});
+
+test("answer choice defers identity selection and legacy participate links open the same sheet", () => {
+  const direct = createHarness();
+  direct.sandbox.__answerFromSheetEvent = {
+    target: {
+      closest() {
+        return { dataset: { participationAction: "answer" } };
+      },
+    },
+  };
+  vm.runInContext(
+    "openParticipationSheet(); handleParticipationDialogClick(__answerFromSheetEvent)",
+    direct.sandbox,
+  );
+  assert.equal(vm.runInContext("ui.route", direct.sandbox), "identity");
+  assert.deepEqual(evaluateJson(direct.sandbox, "ui.pendingIntent"), { type: "answer" });
+
+  const legacy = createHarness({
+    href: "https://example.test/prototype/#participate",
+    hash: "#participate",
+  });
+  vm.runInContext("prepareInitialRoute()", legacy.sandbox);
+  assert.equal(vm.runInContext("ui.route", legacy.sandbox), "wall");
+  assert.equal(vm.runInContext("ui.pendingIntent", legacy.sandbox), null);
+  assert.equal(vm.runInContext("ui.openParticipationAfterRender", legacy.sandbox), true);
+  vm.runInContext("openParticipationSheet()", legacy.sandbox);
+  assert.equal(legacy.participationDialog.open, true);
+  assert.match(legacy.participationDialogContent.innerHTML, /提个问题/);
+  assert.match(legacy.participationDialogContent.innerHTML, /去回答/);
 });
 
 test("approved raster assets retain their original bytes", async () => {
@@ -421,14 +649,14 @@ test("sharing prefers a generated note image when file sharing is supported", as
   assert.equal(shareCalls[0].files.length, 1);
   assert.equal(shareCalls[0].files[0].parts[0], imageBlob);
   assert.equal(shareCalls[0].files[0].type, "image/png");
-  assert.match(shareCalls[0].files[0].name, /^问问墙-.*\.png$/);
+  assert.match(shareCalls[0].files[0].name, /^解鸭留言墙-.*\.png$/);
   assert.match(shareCalls[0].text, /https:\/\/example\.test\/prototype\/\?note=note-01#wall/);
   assert.equal("url" in shareCalls[0], false);
 });
 
-test("an unprepared share click only prepares the note and asks for a second click", async () => {
+test("the explicit share sheet offers three clear actions and the first image action shares", async () => {
   const shareCalls = [];
-  const { sandbox, toast } = createHarness({
+  const { sandbox, shareDialog, shareDialogContent, toast } = createHarness({
     async share(payload) {
       shareCalls.push(payload);
     },
@@ -436,13 +664,67 @@ test("an unprepared share click only prepares the note and asks for a second cli
       return true;
     },
   });
+  class TestFile {
+    constructor(parts, name, options) {
+      this.parts = parts;
+      this.name = name;
+      this.type = options.type;
+    }
+  }
+  sandbox.File = TestFile;
   sandbox.__firstClickImageBlob = { type: "image/png", marker: "first-click-image" };
   vm.runInContext("createNoteImageBlob = async () => __firstClickImageBlob", sandbox);
 
-  await vm.runInContext('shareNote("note-01")', sandbox);
+  vm.runInContext('openShareSheet("note-01")', sandbox);
+  assert.equal(shareDialog.open, true);
+  assert.match(shareDialogContent.innerHTML, /分享便签图片/);
+  assert.match(shareDialogContent.innerHTML, /保存图片/);
+  assert.match(shareDialogContent.innerHTML, /复制链接/);
 
-  assert.equal(shareCalls.length, 0);
-  assert.match(toast.textContent, /便签已准备好，请再点一次分享/);
+  await vm.runInContext('noteSharePreparationPromises.get("note-01")', sandbox);
+  await Promise.resolve();
+  assert.match(
+    shareDialogContent.innerHTML,
+    /data-share-action="share-image"(?![^>]*disabled)/,
+  );
+
+  sandbox.__shareImageEvent = {
+    target: {
+      closest() {
+        return { dataset: { shareAction: "share-image" } };
+      },
+    },
+  };
+  vm.runInContext("handleShareDialogClick(__shareImageEvent)", sandbox);
+
+  assert.equal(shareCalls.length, 1, "one action click should immediately open native sharing");
+  assert.doesNotMatch(toast.textContent, /再点一次/);
+});
+
+test("save image and copy link actions each complete in one selection", async () => {
+  const copied = [];
+  const downloads = [];
+  const { sandbox } = createHarness({
+    async writeText(value) {
+      copied.push(value);
+    },
+  });
+  sandbox.__actionImageBlob = { type: "image/png", marker: "action-image" };
+  sandbox.__downloads = downloads;
+  vm.runInContext(
+    `createNoteImageBlob = async () => __actionImageBlob;
+     downloadNoteImage = (blob, note) => __downloads.push({ blob, id: note.id });`,
+    sandbox,
+  );
+
+  await vm.runInContext('prepareNoteForShare("note-01")', sandbox);
+  assert.equal(vm.runInContext('savePreparedNoteImage("note-01")', sandbox), true);
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].blob, sandbox.__actionImageBlob);
+  assert.equal(downloads[0].id, "note-01");
+
+  assert.equal(await vm.runInContext('copyNoteLink("note-01")', sandbox), true);
+  assert.deepEqual(copied, ["https://example.test/prototype/?note=note-01#wall"]);
 });
 
 test("favorite snapshots remain available after a note leaves the live content window", () => {
@@ -614,9 +896,11 @@ test("emergency lockdown hides favorites without deleting their ids or snapshots
   assert.deepEqual(evaluateJson(sandbox, "getFavoriteNotes()"), []);
 });
 
-test("file share rejection falls through to native text sharing", async () => {
+test("file share rejection falls through to save and copy in the same selection", async () => {
   const shareCalls = [];
-  const { sandbox } = createHarness({
+  const copied = [];
+  const downloads = [];
+  const { sandbox, toast } = createHarness({
     async share(payload) {
       shareCalls.push(payload);
       if (payload.files) {
@@ -628,6 +912,9 @@ test("file share rejection falls through to native text sharing", async () => {
     canShare() {
       return true;
     },
+    async writeText(value) {
+      copied.push(value);
+    },
   });
   class TestFile {
     constructor(parts, name, options) {
@@ -638,22 +925,28 @@ test("file share rejection falls through to native text sharing", async () => {
   }
   sandbox.File = TestFile;
   sandbox.__imageBlob = { type: "image/png" };
-  vm.runInContext("createNoteImageBlob = async () => __imageBlob", sandbox);
+  sandbox.__fallbackDownloads = downloads;
+  vm.runInContext(
+    `createNoteImageBlob = async () => __imageBlob;
+     downloadNoteImage = (blob, note) => __fallbackDownloads.push({ blob, id: note.id });`,
+    sandbox,
+  );
 
   await vm.runInContext('prepareNoteForShare("note-01")', sandbox);
-  await vm.runInContext('shareNote("note-01")', sandbox);
+  const completed = await vm.runInContext('sharePreparedNoteImage("note-01")', sandbox);
 
   assert.equal(shareCalls.length, 1);
   assert.equal(shareCalls[0].files.length, 1);
-
-  await vm.runInContext('shareNote("note-01")', sandbox);
-
-  assert.equal(shareCalls.length, 2);
-  assert.equal("files" in shareCalls[1], false);
-  assert.equal(shareCalls[1].url, "https://example.test/prototype/?note=note-01#wall");
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].blob, sandbox.__imageBlob);
+  assert.equal(downloads[0].id, "note-01");
+  assert.equal(copied.length, 1);
+  assert.match(copied[0], /https:\/\/example\.test\/prototype\/\?note=note-01#wall/);
+  assert.equal(completed, true);
+  assert.doesNotMatch(toast.textContent, /再点一次/);
 });
 
-test("a prepared share calls native sharing synchronously without revalidating or rerendering", async () => {
+test("a prepared image action calls native sharing synchronously without revalidating or rerendering", async () => {
   const note = {
     id: "ready-note-101",
     questionId: "ready-question-101",
@@ -712,9 +1005,9 @@ test("a prepared share calls native sharing synchronously without revalidating o
   calls.loadNote = 0;
   calls.createImage = 0;
 
-  const sharing = vm.runInContext(`shareNote(${JSON.stringify(note.id)})`, sandbox);
+  const sharing = vm.runInContext(`sharePreparedNoteImage(${JSON.stringify(note.id)})`, sandbox);
 
-  assert.equal(shareCalls.length, 1, "native share must start before shareNote yields");
+  assert.equal(shareCalls.length, 1, "native share must start before the image action yields");
   assert.equal(calls.loadNote, 0);
   assert.equal(calls.createImage, 0);
   assert.equal(shareCalls[0].files.length, 1);
