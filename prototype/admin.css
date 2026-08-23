@@ -66,6 +66,17 @@ button:disabled {
   display: none !important;
 }
 
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
 .skip-link {
   position: fixed;
   top: 8px;
@@ -431,7 +442,7 @@ button:disabled {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  grid-template-columns: repeat(5, minmax(110px, 1fr));
   margin: 0;
 }
 
@@ -778,6 +789,367 @@ button:disabled {
   color: var(--red);
 }
 
+.photo-capture-panel {
+  overflow: hidden;
+  border: 1px solid rgba(24, 33, 29, 0.12);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(46, 52, 48, 0.05);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+.photo-capture-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--line);
+}
+
+.photo-capture-heading h3,
+.photo-form-intro strong {
+  margin: 0;
+  font-size: 19px;
+}
+
+.photo-capture-heading > p {
+  max-width: 520px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: right;
+}
+
+.photo-collector-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(380px, 1.1fr);
+  gap: 0;
+}
+
+.photo-capture-card,
+.photo-metadata-form {
+  min-width: 0;
+  padding: 22px;
+}
+
+.photo-capture-card {
+  border-right: 1px solid var(--line);
+}
+
+.photo-capture-stage {
+  position: relative;
+  display: grid;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  place-items: center;
+  border: 1px dashed rgba(32, 95, 90, 0.34);
+  border-radius: 8px;
+  background:
+    linear-gradient(45deg, rgba(32, 95, 90, 0.035) 25%, transparent 25%) 0 0 / 18px 18px,
+    linear-gradient(-45deg, rgba(32, 95, 90, 0.035) 25%, transparent 25%) 0 9px / 18px 18px,
+    #f6f8f6;
+  isolation: isolate;
+}
+
+.photo-capture-stage[data-state="filled"] {
+  border-style: solid;
+  border-color: rgba(24, 33, 29, 0.14);
+  background: #dfe4e1;
+}
+
+.photo-capture-stage img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transition: transform 180ms ease;
+}
+
+.photo-empty-state {
+  display: grid;
+  max-width: 310px;
+  justify-items: center;
+  gap: 7px;
+  padding: 22px;
+  text-align: center;
+}
+
+.photo-empty-state strong {
+  font-size: 15px;
+}
+
+.photo-empty-state small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.photo-empty-icon {
+  position: relative;
+  width: 46px;
+  height: 36px;
+  margin-bottom: 5px;
+  border: 2px solid var(--teal);
+  border-radius: 8px;
+}
+
+.photo-empty-icon::before {
+  position: absolute;
+  top: -8px;
+  left: 8px;
+  width: 14px;
+  height: 7px;
+  border: 2px solid var(--teal);
+  border-bottom: 0;
+  border-radius: 4px 4px 0 0;
+  content: "";
+}
+
+.photo-empty-icon::after {
+  position: absolute;
+  top: 9px;
+  left: 14px;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--teal);
+  border-radius: 50%;
+  content: "";
+}
+
+.photo-processing {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
+  color: #fff;
+  background: rgba(24, 33, 29, 0.68);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.photo-processing span {
+  width: 24px;
+  height: 24px;
+  border: 3px solid rgba(255, 255, 255, 0.34);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: photo-spin 700ms linear infinite;
+}
+
+@keyframes photo-spin {
+  to { transform: rotate(360deg); }
+}
+
+.photo-source-actions,
+.photo-edit-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 12px;
+}
+
+.photo-edit-actions {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.photo-edit-actions button {
+  min-height: 40px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.photo-file-meta {
+  min-height: 19px;
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.photo-metadata-form {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+}
+
+.photo-form-intro {
+  display: grid;
+  gap: 5px;
+  padding-bottom: 4px;
+}
+
+.photo-form-intro span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.photo-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.photo-field textarea,
+.photo-field select {
+  grid-column: 1 / -1;
+  width: 100%;
+  border: 1px solid rgba(24, 33, 29, 0.18);
+  border-radius: 6px;
+  outline: none;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.photo-field textarea {
+  min-height: 74px;
+  padding: 11px 12px;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.photo-field select {
+  height: 44px;
+  padding: 0 11px;
+}
+
+.photo-field textarea:focus,
+.photo-field select:focus {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(32, 95, 90, 0.12);
+}
+
+.photo-field small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.photo-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid rgba(163, 113, 29, 0.2);
+  border-radius: 6px;
+  background: rgba(246, 238, 220, 0.56);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.photo-consent input {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--teal);
+}
+
+.photo-submit-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-top: 2px;
+}
+
+.photo-submit-bar p {
+  min-height: 20px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.photo-submit-bar p.is-error {
+  color: var(--red);
+}
+
+.photo-review-item {
+  grid-template-columns: 210px minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.photo-review-media {
+  position: relative;
+  display: grid;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #e3e7e4;
+}
+
+.photo-review-media img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.photo-review-media span {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.photo-review-media.is-loading::after {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.56) 45%, transparent 70%) -180px 0 / 180px 100% no-repeat;
+  animation: photo-skeleton 1.2s ease-in-out infinite;
+  content: "";
+}
+
+@keyframes photo-skeleton {
+  to { background-position: calc(100% + 180px) 0; }
+}
+
+.photo-review-media.is-error {
+  border-color: rgba(166, 71, 62, 0.22);
+  background: var(--red-soft);
+}
+
+.photo-transcript-grid {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.photo-transcript-grid p {
+  margin: 0;
+  padding: 9px 11px;
+  border-left: 3px solid rgba(32, 95, 90, 0.36);
+  background: rgba(229, 241, 239, 0.45);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.photo-transcript-grid strong {
+  margin-right: 6px;
+  color: var(--teal);
+}
+
+.photo-alt-text {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .review-list {
   display: grid;
   gap: 10px;
@@ -980,6 +1352,27 @@ button:disabled {
   padding: 28px;
 }
 
+.photo-edit-dialog form {
+  display: grid;
+  max-height: min(760px, calc(100vh - 36px));
+  max-height: min(760px, calc(100dvh - 36px));
+  overflow-y: auto;
+  gap: 15px;
+}
+
+.photo-edit-dialog .dialog-heading {
+  margin-bottom: 1px;
+}
+
+.photo-edit-dialog .dialog-actions {
+  position: sticky;
+  bottom: -28px;
+  margin: 2px -28px -28px;
+  padding: 14px 28px calc(14px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: rgba(252, 253, 252, 0.96);
+}
+
 .dialog-heading {
   margin-bottom: 22px;
 }
@@ -1112,6 +1505,23 @@ button:disabled {
   .review-item {
     grid-template-columns: 1fr;
     gap: 18px;
+  }
+
+  .photo-collector-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .photo-capture-card {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .photo-review-item {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+
+  .photo-review-item .review-actions {
+    grid-column: 1 / -1;
   }
 
   .review-actions {
@@ -1271,6 +1681,78 @@ button:disabled {
     padding: 17px 15px;
   }
 
+  .photo-capture-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+    padding: 18px 15px;
+  }
+
+  .photo-capture-heading > p {
+    text-align: left;
+  }
+
+  .photo-capture-card,
+  .photo-metadata-form {
+    padding: 15px;
+  }
+
+  .photo-capture-stage {
+    aspect-ratio: 1 / 1;
+  }
+
+  .photo-source-actions,
+  .photo-edit-actions {
+    gap: 7px;
+  }
+
+  .photo-source-actions .button {
+    padding-inline: 10px;
+    font-size: 13px;
+  }
+
+  .photo-edit-actions button {
+    min-height: 44px;
+  }
+
+  .photo-submit-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 4;
+    align-items: stretch;
+    flex-direction: column;
+    margin: 2px -15px -15px;
+    padding: 11px 15px calc(11px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+    background: rgba(250, 252, 250, 0.94);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+  }
+
+  .photo-submit-bar p:empty {
+    display: none;
+  }
+
+  .photo-submit-bar .button {
+    width: 100%;
+  }
+
+  .photo-review-item {
+    grid-template-columns: 1fr;
+  }
+
+  .photo-review-media {
+    aspect-ratio: 4 / 3;
+  }
+
+  .photo-review-item .review-actions {
+    grid-column: auto;
+  }
+
+  .photo-review-item .review-actions .action-button:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+
   .runtime-panel-heading {
     align-items: flex-start;
     flex-direction: column;
@@ -1311,6 +1793,12 @@ button:disabled {
 
   .reason-dialog form {
     padding: 23px 18px 18px;
+  }
+
+  .photo-edit-dialog .dialog-actions {
+    bottom: -18px;
+    margin: 2px -18px -18px;
+    padding: 12px 18px calc(12px + env(safe-area-inset-bottom));
   }
 
   .dialog-actions .button {
@@ -1356,7 +1844,9 @@ button:disabled {
   .admin-header,
   .login-view,
   .runtime-panel,
-  .review-item {
+  .review-item,
+  .photo-capture-panel,
+  .photo-submit-bar {
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }

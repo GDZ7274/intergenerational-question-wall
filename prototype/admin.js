@@ -6,6 +6,10 @@
   const supabaseAnonKey = String(config.supabaseAnonKey || "");
   const sessionKey = "question-wall-admin-session";
   const pageSize = 50;
+  const maxPhotoBytes = 20 * 1024 * 1024;
+  const maxPhotoDimension = 2048;
+  const maxEncodedPhotoBytes = 7.5 * 1024 * 1024;
+  const photoOutputQuality = 0.84;
   const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
     month: "numeric",
     day: "numeric",
@@ -32,9 +36,11 @@
     summaryAnswers: document.getElementById("summary-answers"),
     summaryReports: document.getElementById("summary-reports"),
     summaryPublished: document.getElementById("summary-published"),
+    summaryPhotoNotes: document.getElementById("summary-photo-notes"),
     tabCountQuestions: document.getElementById("tab-count-questions"),
     tabCountAnswers: document.getElementById("tab-count-answers"),
     tabCountReports: document.getElementById("tab-count-reports"),
+    tabCountPhotoNotes: document.getElementById("tab-count-photo-notes"),
     tabs: [...document.querySelectorAll(".queue-tab")],
     workspace: document.querySelector(".workspace"),
     workspaceEyebrow: document.getElementById("workspace-eyebrow"),
@@ -44,11 +50,37 @@
     contentType: document.getElementById("content-type"),
     contentStatusField: document.getElementById("content-status-field"),
     contentStatus: document.getElementById("content-status"),
+    photoStatusField: document.getElementById("photo-status-field"),
+    photoStatus: document.getElementById("photo-status"),
     workspaceLoading: document.getElementById("workspace-loading"),
     workspaceEmpty: document.getElementById("workspace-empty"),
     workspaceError: document.getElementById("workspace-error"),
     contentList: document.getElementById("content-list"),
     loadMoreButton: document.getElementById("load-more-button"),
+    photoCapturePanel: document.getElementById("photo-capture-panel"),
+    photoCaptureStage: document.getElementById("photo-capture-stage"),
+    photoEmptyState: document.getElementById("photo-empty-state"),
+    photoPreview: document.getElementById("photo-preview"),
+    photoProcessing: document.getElementById("photo-processing"),
+    photoCameraInput: document.getElementById("photo-camera-input"),
+    photoGalleryInput: document.getElementById("photo-gallery-input"),
+    photoCameraButton: document.getElementById("photo-camera-button"),
+    photoGalleryButton: document.getElementById("photo-gallery-button"),
+    photoEditActions: document.getElementById("photo-edit-actions"),
+    photoFileMeta: document.getElementById("photo-file-meta"),
+    photoMetadataForm: document.getElementById("photo-metadata-form"),
+    photoDirection: document.getElementById("photo-direction"),
+    photoQuestionText: document.getElementById("photo-question-text"),
+    photoAnswerText: document.getElementById("photo-answer-text"),
+    photoAltText: document.getElementById("photo-alt-text"),
+    photoInternalNote: document.getElementById("photo-internal-note"),
+    photoSafetyCheck: document.getElementById("photo-safety-check"),
+    photoQuestionCount: document.getElementById("photo-question-count"),
+    photoAnswerCount: document.getElementById("photo-answer-count"),
+    photoAltCount: document.getElementById("photo-alt-count"),
+    photoNoteCount: document.getElementById("photo-note-count"),
+    photoCaptureStatus: document.getElementById("photo-capture-status"),
+    photoSubmitButton: document.getElementById("photo-submit-button"),
     runtimePanel: document.getElementById("runtime-panel"),
     runtimeForm: document.getElementById("runtime-form"),
     runtimeSubmissionsPaused: document.getElementById("runtime-submissions-paused"),
@@ -69,6 +101,15 @@
     reasonCount: document.getElementById("reason-count"),
     reasonError: document.getElementById("reason-error"),
     reasonConfirm: document.getElementById("reason-confirm"),
+    photoEditDialog: document.getElementById("photo-edit-dialog"),
+    photoEditForm: document.getElementById("photo-edit-form"),
+    photoEditDirection: document.getElementById("photo-edit-direction"),
+    photoEditQuestion: document.getElementById("photo-edit-question"),
+    photoEditAnswer: document.getElementById("photo-edit-answer"),
+    photoEditAlt: document.getElementById("photo-edit-alt"),
+    photoEditNote: document.getElementById("photo-edit-note"),
+    photoEditError: document.getElementById("photo-edit-error"),
+    photoEditSave: document.getElementById("photo-edit-save"),
     emergencyDialog: document.getElementById("emergency-dialog"),
     emergencyForm: document.getElementById("emergency-form"),
     emergencyAck: document.getElementById("emergency-ack"),
@@ -86,6 +127,15 @@
     search: "",
     contentType: "questions",
     contentStatus: "",
+    photoStatus: "pending",
+    photoFile: null,
+    photoSource: "",
+    photoPreviewUrl: "",
+    photoRotation: 0,
+    photoDraft: null,
+    photoSubmitting: false,
+    photoPreviewUrls: new Map(),
+    pendingPhotoEdit: null,
     pendingAction: null,
     pendingRuntimeSettings: null,
     sessionRefreshPromise: null,
@@ -103,6 +153,8 @@
     answers: ["审核队列", "待审回答"],
     reports: ["风险处置", "未处理举报"],
     content: ["内容运营", "内容管理"],
+    photo_capture: ["实体便签", "照片采集"],
+    photo_notes: ["实体便签", "照片审核"],
     history: ["权限审计", "操作记录"],
     runtime: ["站点安全", "运营开关"],
   };
@@ -243,6 +295,154 @@
     return response.json();
   }
 
+  async function photoMediaRequest(body, retry = true) {
+    await refreshSession();
+    const response = await fetch(`${supabaseUrl}/functions/v1/photo-note-media`, {
+      method: "POST",
+      headers: apiHeaders(state.session.accessToken),
+      body: JSON.stringify(body),
+    });
+
+    if (response.status === 401 && retry) {
+      await refreshSession(true);
+      return photoMediaRequest(body, false);
+    }
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload?.ok === false) {
+      const error = new Error(payload.message || `照片服务请求失败（${response.status}）`);
+      error.status = response.status;
+      error.code = payload.error || payload.code || "photo_media_error";
+      throw error;
+    }
+    return payload;
+  }
+
+  function normalizePhotoNote(row) {
+    if (!row || typeof row !== "object") return null;
+    return {
+      id: row.id,
+      status: row.status || "draft",
+      direction: row.direction || "",
+      questionText: row.questionText ?? row.question_text ?? "",
+      answerText: row.answerText ?? row.answer_text ?? "",
+      altText: row.altText ?? row.alt_text ?? "",
+      internalNote: row.internalNote ?? row.internal_note ?? "",
+      rotationDegrees: Number(row.rotationDegrees ?? row.rotation_degrees ?? 0),
+      stagingObjectPath: row.stagingObjectPath ?? row.staging_object_path ?? "",
+      publicObjectPath: row.publicObjectPath ?? row.public_object_path ?? "",
+      publicUrl: row.publicUrl ?? row.public_url ?? row.mediaUrl ?? row.media_url ?? "",
+      mimeType: row.mimeType ?? row.mime_type ?? "",
+      fileSizeBytes: Number(row.fileSizeBytes ?? row.file_size_bytes ?? 0),
+      width: Number(row.width || 0),
+      height: Number(row.height || 0),
+      featured: Boolean(row.featured),
+      createdAt: row.createdAt ?? row.created_at ?? null,
+      updatedAt: row.updatedAt ?? row.updated_at ?? null,
+      moderatedAt: row.moderatedAt ?? row.moderated_at ?? null,
+      moderationReason: row.moderationReason ?? row.moderation_reason ?? "",
+      publishedAt: row.publishedAt ?? row.published_at ?? null,
+    };
+  }
+
+  function encodeStoragePath(path) {
+    return String(path || "")
+      .split("/")
+      .filter(Boolean)
+      .map((part) => encodeURIComponent(part))
+      .join("/");
+  }
+
+  function publicPhotoUrl(path) {
+    const encodedPath = encodeStoragePath(path);
+    return encodedPath ? `${supabaseUrl}/storage/v1/object/public/photo-note-public/${encodedPath}` : "";
+  }
+
+  const photoNoteBackend = Object.freeze({
+    async list({ status = null, search = null, limit = pageSize, offset = 0 } = {}) {
+      const rows = await rpc("admin_list_photo_notes", {
+        p_status: status || null,
+        p_search: search || null,
+        p_limit: limit,
+        p_offset: offset,
+      });
+      return (Array.isArray(rows) ? rows : []).map(normalizePhotoNote).filter(Boolean);
+    },
+    async createDraft(metadata) {
+      const payload = await photoMediaRequest({ action: "createDraft", ...metadata });
+      return { note: normalizePhotoNote(payload.note), upload: payload.upload || null };
+    },
+    async upload(upload, blob) {
+      if (!upload?.signedUrl) throw new Error("没有取得安全上传地址，请重新提交。");
+      let uploadUrl;
+      try {
+        uploadUrl = new URL(upload.signedUrl, `${supabaseUrl}/`);
+      } catch {
+        throw new Error("安全上传地址无效，请重新提交。");
+      }
+      if (uploadUrl.origin !== new URL(supabaseUrl).origin) {
+        throw new Error("安全上传地址与当前项目不匹配，已停止上传。");
+      }
+      const response = await fetch(uploadUrl.href, {
+        method: "PUT",
+        headers: { "Content-Type": blob.type || "image/jpeg" },
+        body: blob,
+      });
+      if (!response.ok) throw new Error(`照片上传失败（${response.status}），请重试。`);
+    },
+    async completeDraft(id, dimensions, metadata) {
+      const payload = await photoMediaRequest({
+        action: "completeDraft",
+        id,
+        width: dimensions.width,
+        height: dimensions.height,
+        ...metadata,
+      });
+      return normalizePhotoNote(payload.note);
+    },
+    async preview(id) {
+      const payload = await photoMediaRequest({ action: "preview", id });
+      return payload.preview || null;
+    },
+    async get(id) {
+      return normalizePhotoNote(await rpc("admin_get_photo_note", { p_id: id }));
+    },
+    async refreshUpload(id) {
+      const payload = await photoMediaRequest({ action: "refreshUpload", id });
+      return payload.upload || null;
+    },
+    async update(id, patch) {
+      const row = await rpc("admin_update_photo_note", { p_id: id, p_patch: patch });
+      return normalizePhotoNote(Array.isArray(row) ? row[0] : row);
+    },
+    async moderate(id, action, reason = "") {
+      if (action === "approve" || action === "publish") {
+        const payload = await photoMediaRequest({ action: "publish", id });
+        return normalizePhotoNote(payload.note);
+      }
+      if (action === "hide") {
+        const payload = await photoMediaRequest({ action: "hide", id, reason: reason || null });
+        if (payload.mediaRemoved === false) {
+          const error = new Error("内容已下架，但公开图片清理尚未完成，请稍后复核。");
+          error.code = "media_cleanup_pending";
+          error.stateChanged = true;
+          throw error;
+        }
+        return normalizePhotoNote(payload.note);
+      }
+      const row = await rpc("admin_moderate_photo_note", {
+        p_id: id,
+        p_action: action,
+        p_reason: reason || null,
+        p_public_object_path: null,
+      });
+      return normalizePhotoNote(Array.isArray(row) ? row[0] : row);
+    },
+    async cleanupHiddenMedia(id) {
+      return photoMediaRequest({ action: "removeHiddenPublicMedia", id });
+    },
+  });
+
   async function requestMagicLink(email) {
     const redirectTo = encodeURIComponent(moderationRedirectUrl());
     const response = await fetch(`${supabaseUrl}/auth/v1/otp?redirect_to=${redirectTo}`, {
@@ -315,11 +515,13 @@
   }
 
   function roleLabel(role) {
-    return role === "adult" ? "大人" : "小朋友";
+    return role === "adult" ? "大朋友" : "小朋友";
   }
 
   function directionLabel(direction) {
-    return direction === "adult_to_child" ? "大人问 · 小朋友答" : "小朋友问 · 大人答";
+    if (direction === "adult_to_child") return "大朋友问 · 小朋友答";
+    if (direction === "child_to_adult") return "小朋友问 · 大朋友答";
+    return "方向待补充";
   }
 
   function normalizeRuntimeSettings(value) {
@@ -415,6 +617,7 @@
   function statusLabel(status) {
     return {
       pending: "待审核",
+      draft: "未提交",
       open: "开放中",
       closed: "已关闭",
       published: "已发布",
@@ -467,6 +670,7 @@
     if (options.entityId) button.dataset.entityId = options.entityId;
     if (options.answerId) button.dataset.answerId = options.answerId;
     if (options.answerStatus) button.dataset.answerStatus = options.answerStatus;
+    if (options.photoNoteId) button.dataset.photoNoteId = options.photoNoteId;
     return button;
   }
 
@@ -510,6 +714,118 @@
     } else if (["hidden", "rejected"].includes(row.status)) {
       container.append(actionButton("重新发布", "publish", { ...options, className: "is-approve" }));
     }
+  }
+
+  function appendPhotoNoteActions(container, row) {
+    const options = { entityType: "photo_note", entityId: row.id };
+    container.append(actionButton("核对文字", "edit_photo", options));
+    if (row.status === "pending") {
+      container.append(
+        actionButton("通过并发布", "approve", { ...options, className: "is-approve" }),
+        actionButton("驳回", "reject", { ...options, className: "is-danger" }),
+      );
+    } else if (row.status === "published") {
+      container.append(
+        actionButton(row.featured ? "取消精选" : "设为精选", row.featured ? "unfeature" : "feature", options),
+        actionButton("下架", "hide", { ...options, className: "is-danger" }),
+      );
+    } else if (row.status === "hidden") {
+      container.append(actionButton("重新发布", "publish", { ...options, className: "is-approve" }));
+    }
+  }
+
+  function formatFileSize(value) {
+    const bytes = Number(value || 0);
+    if (!bytes) return "";
+    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  async function resolvePhotoPreviewUrl(row) {
+    if (row.publicUrl) return row.publicUrl;
+    if (row.status === "published" && row.publicObjectPath) return publicPhotoUrl(row.publicObjectPath);
+    const cached = state.photoPreviewUrls.get(row.id);
+    if (cached?.url && cached.expiresAt > Date.now() + 15_000) return cached.url;
+    if (cached?.promise) return cached.promise;
+
+    const promise = photoNoteBackend.preview(row.id).then((preview) => {
+      if (!preview?.url) throw new Error("没有可用的照片预览。");
+      const entry = {
+        url: preview.url,
+        expiresAt: Date.now() + Math.max(30, Number(preview.expiresIn || 600)) * 1000,
+      };
+      state.photoPreviewUrls.set(row.id, entry);
+      return entry.url;
+    }).catch((error) => {
+      state.photoPreviewUrls.delete(row.id);
+      throw error;
+    });
+    state.photoPreviewUrls.set(row.id, { promise });
+    return promise;
+  }
+
+  function loadPhotoPreview(row, frame, image, fallback) {
+    resolvePhotoPreviewUrl(row).then((url) => {
+      if (!frame.isConnected) return;
+      image.addEventListener("load", () => {
+        frame.classList.remove("is-loading", "is-error");
+        fallback.hidden = true;
+        image.hidden = false;
+      }, { once: true });
+      image.addEventListener("error", () => {
+        frame.classList.remove("is-loading");
+        frame.classList.add("is-error");
+        image.hidden = true;
+        fallback.hidden = false;
+        fallback.textContent = "照片暂时无法显示，可刷新后重试";
+      }, { once: true });
+      image.src = url;
+    }).catch(() => {
+      if (!frame.isConnected) return;
+      frame.classList.remove("is-loading");
+      frame.classList.add("is-error");
+      fallback.textContent = "预览读取失败，可刷新后重试";
+    });
+  }
+
+  function renderPhotoNote(row) {
+    const item = createElement("article", "review-item photo-review-item");
+    const media = createElement("div", "photo-review-media is-loading");
+    const image = document.createElement("img");
+    image.alt = row.altText || "实体便签照片";
+    image.loading = "lazy";
+    image.hidden = true;
+    const fallback = createElement("span", "", "正在取得安全预览…");
+    media.append(image, fallback);
+    loadPhotoPreview(row, media, image, fallback);
+
+    const main = createElement("div", "review-item-main");
+    const meta = createElement("div", "review-meta");
+    metaText(meta, formatDate(row.createdAt));
+    metaText(meta, formatFileSize(row.fileSizeBytes));
+    if (row.width && row.height) metaText(meta, `${row.width} × ${row.height}`);
+    if (row.featured) metaText(meta, "精选内容");
+    const tags = createElement("div", "review-tags");
+    tags.append(statusBadge(row.status), directionBadge(row.direction));
+    const transcript = createElement("div", "photo-transcript-grid");
+    const question = createElement("p");
+    question.append(createElement("strong", "", "问"), document.createTextNode(row.questionText || "未录入"));
+    const answer = createElement("p");
+    answer.append(createElement("strong", "", "答"), document.createTextNode(row.answerText || "未录入"));
+    transcript.append(question, answer);
+    const altText = createElement("p", "photo-alt-text", `图片描述：${row.altText || "未录入"}`);
+    main.append(meta, tags, transcript, altText);
+    if (row.internalNote) main.append(createElement("p", "photo-alt-text", `内部备注：${row.internalNote}`));
+    if (row.moderationReason) {
+      const note = createElement("p", "moderation-note");
+      note.append(createElement("strong", "", "处理原因"), document.createTextNode(row.moderationReason));
+      main.append(note);
+    }
+
+    const actions = createElement("div", "review-actions");
+    appendPhotoNoteActions(actions, row);
+    item.append(media, main, actions);
+    return item;
   }
 
   function renderQuestion(row, queueMode = true) {
@@ -562,10 +878,27 @@
   }
 
   function renderReport(row) {
-    const item = createElement("article", "review-item");
+    const isPhoto = row.noteKind === "photo";
+    const item = createElement("article", `review-item${isPhoto ? " photo-review-item" : ""}`);
+    if (isPhoto) {
+      const media = createElement("div", "photo-review-media is-loading");
+      const image = document.createElement("img");
+      image.alt = row.altText || "被举报的实体便签照片";
+      image.loading = "lazy";
+      image.hidden = true;
+      const fallback = createElement("span", "", "正在取得安全预览…");
+      media.append(image, fallback);
+      loadPhotoPreview({
+        id: row.photoNoteId,
+        status: row.answerStatus,
+        publicObjectPath: row.publicObjectPath,
+      }, media, image, fallback);
+      item.append(media);
+    }
     const main = createElement("div", "review-item-main");
     const meta = createElement("div", "review-meta");
     metaText(meta, formatDate(row.createdAt));
+    metaText(meta, isPhoto ? "实体便签照片" : "文字便签");
     metaText(meta, `举报原因：${row.reason}`);
     metaText(meta, `便签状态：${statusLabel(row.answerStatus)}`);
     const question = createElement("p", "review-question", `问题：${row.questionBody}`);
@@ -580,6 +913,7 @@
       entityId: row.id,
       answerId: row.answerId,
       answerStatus: row.answerStatus,
+      photoNoteId: row.photoNoteId || "",
     };
     if (row.answerStatus === "published") {
       actions.append(actionButton("下架并解决", "hide_and_resolve", { ...options, className: "is-danger" }));
@@ -630,6 +964,14 @@
     elements.contentList.replaceChildren();
     elements.workspaceLoading.hidden = true;
     elements.workspaceError.hidden = true;
+    elements.photoCapturePanel.hidden = state.view !== "photo_capture";
+    if (state.view === "photo_capture") {
+      elements.runtimePanel.hidden = true;
+      elements.contentList.hidden = true;
+      elements.workspaceEmpty.hidden = true;
+      elements.loadMoreButton.hidden = true;
+      return;
+    }
     if (state.view === "runtime") {
       elements.runtimePanel.hidden = false;
       elements.contentList.hidden = true;
@@ -650,6 +992,7 @@
       if (state.view === "questions") fragment.append(renderQuestion(row, true));
       else if (state.view === "answers") fragment.append(renderAnswer(row, true));
       else if (state.view === "reports") fragment.append(renderReport(row));
+      else if (state.view === "photo_notes") fragment.append(renderPhotoNote(row));
       else if (state.view === "history") fragment.append(renderHistory(row));
       else if (state.contentType === "questions") fragment.append(renderQuestion(row, false));
       else fragment.append(renderAnswer(row, false));
@@ -663,9 +1006,12 @@
     elements.summaryAnswers.textContent = String(summary.pendingAnswers || 0);
     elements.summaryReports.textContent = String(summary.openReports || 0);
     elements.summaryPublished.textContent = String(summary.publishedNotes || 0);
+    const pendingPhotoNotes = summary.pendingPhotoNotes ?? summary.pending_photo_notes ?? 0;
+    elements.summaryPhotoNotes.textContent = String(pendingPhotoNotes);
     elements.tabCountQuestions.textContent = String(summary.pendingQuestions || 0);
     elements.tabCountAnswers.textContent = String(summary.pendingAnswers || 0);
     elements.tabCountReports.textContent = String(summary.openReports || 0);
+    elements.tabCountPhotoNotes.textContent = String(pendingPhotoNotes);
   }
 
   function updateViewChrome() {
@@ -677,13 +1023,16 @@
       else tab.removeAttribute("aria-current");
     });
 
-    const showSearch = !["reports", "history", "runtime"].includes(state.view);
+    const showSearch = !["reports", "history", "runtime", "photo_capture"].includes(state.view);
     elements.contentSearch.closest("label").hidden = !showSearch;
+    elements.contentSearch.placeholder = state.view === "photo_notes" ? "搜索照片转写" : "搜索问题或回答";
     elements.contentTypeField.hidden = state.view !== "content";
     elements.contentStatusField.hidden = state.view !== "content";
+    elements.photoStatusField.hidden = state.view !== "photo_notes";
     if (state.view === "content") rebuildContentStatusOptions();
     elements.runtimePanel.hidden = state.view !== "runtime";
-    if (state.view !== "runtime") elements.contentList.hidden = false;
+    elements.photoCapturePanel.hidden = state.view !== "photo_capture";
+    if (!["runtime", "photo_capture"].includes(state.view)) elements.contentList.hidden = false;
   }
 
   async function loadSummary() {
@@ -704,7 +1053,14 @@
       return rpc("admin_list_reports", { p_status: "open", p_limit: pageSize, p_offset: offset });
     } else if (viewState.view === "history") {
       return rpc("admin_list_actions", { p_limit: pageSize, p_offset: offset });
-    } else if (viewState.view === "runtime") {
+    } else if (viewState.view === "photo_notes") {
+      return photoNoteBackend.list({
+        status: viewState.photoStatus || null,
+        search,
+        limit: pageSize,
+        offset,
+      });
+    } else if (["runtime", "photo_capture"].includes(viewState.view)) {
       return [];
     } else if (viewState.contentType === "questions") {
       return rpc("admin_list_questions", { p_status: viewState.contentStatus || null, p_search: search, p_limit: pageSize, p_offset: offset });
@@ -719,6 +1075,7 @@
       search: state.search,
       contentType: state.contentType,
       contentStatus: state.contentStatus,
+      photoStatus: state.photoStatus,
     };
   }
 
@@ -752,7 +1109,7 @@
 
       state.summary = summary || {};
       state.rows = Array.isArray(rows) ? rows : [];
-      state.hasMore = state.rows.length === pageSize && viewState.view !== "runtime";
+      state.hasMore = state.rows.length === pageSize && !["runtime", "photo_capture"].includes(viewState.view);
       state.runtimeSettings = runtimeSettings;
       renderSummary();
       renderRuntimeSettings();
@@ -769,15 +1126,22 @@
     elements.workspaceError.hidden = true;
     elements.workspaceEmpty.hidden = true;
     elements.loadMoreButton.hidden = true;
-    if (state.view !== "runtime") {
+    if (!["runtime", "photo_capture"].includes(state.view)) {
       elements.runtimePanel.hidden = true;
+      elements.photoCapturePanel.hidden = true;
       elements.contentList.hidden = false;
       elements.contentList.replaceChildren();
       elements.workspaceLoading.hidden = false;
+    } else if (state.view === "photo_capture") {
+      elements.runtimePanel.hidden = true;
+      elements.photoCapturePanel.hidden = false;
+      elements.contentList.hidden = true;
+      elements.workspaceLoading.hidden = true;
     } else {
       elements.contentList.hidden = true;
       elements.workspaceLoading.hidden = true;
       elements.runtimePanel.hidden = false;
+      elements.photoCapturePanel.hidden = true;
     }
 
     if (state.workspaceRefreshPromise) return state.workspaceRefreshPromise;
@@ -798,7 +1162,7 @@
   }
 
   function loadMoreRows() {
-    if (state.workspaceRefreshPromise || state.loadMorePromise || !state.hasMore || state.view === "runtime") {
+    if (state.workspaceRefreshPromise || state.loadMorePromise || !state.hasMore || ["runtime", "photo_capture"].includes(state.view)) {
       return state.loadMorePromise || state.workspaceRefreshPromise || Promise.resolve();
     }
 
@@ -848,7 +1212,9 @@
       hide_and_resolve: "下架便签并解决举报",
     }[action.action] || "确认处理";
     const required = actionRequiresReason(action.action);
-    elements.reasonEyebrow.textContent = action.entityType === "report" ? "举报处置" : "内容审核";
+    elements.reasonEyebrow.textContent = action.entityType === "report"
+      ? "举报处置"
+      : action.entityType === "photo_note" ? "照片审核" : "内容审核";
     elements.reasonTitle.textContent = label;
     elements.reasonConfirm.textContent = label;
     elements.reasonLabel.textContent = required ? "驳回原因（必填）" : "处理说明（建议填写）";
@@ -875,13 +1241,27 @@
         await rpc("admin_moderate_question", { p_id: action.entityId, p_action: action.action, p_reason: reason || null });
       } else if (action.entityType === "answer") {
         await rpc("admin_moderate_answer", { p_id: action.entityId, p_action: action.action, p_reason: reason || null });
+      } else if (action.entityType === "photo_note") {
+        await photoNoteBackend.moderate(action.entityId, action.action, reason);
       } else {
-        await rpc("admin_resolve_report", { p_id: action.entityId, p_action: action.action, p_note: reason || null });
+        const result = await rpc("admin_resolve_report", { p_id: action.entityId, p_action: action.action, p_note: reason || null });
+        if (action.action === "hide_and_resolve" && action.photoNoteId && result?.noteKind === "photo") {
+          try {
+            await photoNoteBackend.cleanupHiddenMedia(action.photoNoteId);
+          } catch {
+            showToast("内容已下架，但公开图片清理未确认，请在照片审核中复核。", true);
+            await refreshWorkspace();
+            return;
+          }
+        }
       }
       showToast("处理已保存并写入操作记录。");
       await refreshWorkspace();
     } catch (error) {
-      if (["23514", "P0002", "40001", "PGRST116"].includes(error.code) || error.status === 409) {
+      if (error.stateChanged) {
+        showToast(error.message, true);
+        await refreshWorkspace();
+      } else if (["23514", "P0002", "40001", "PGRST116"].includes(error.code) || error.status === 409) {
         showToast("内容状态已经变化，列表已刷新。", true);
         await refreshWorkspace();
       } else {
@@ -902,10 +1282,296 @@
       entityId: button.dataset.entityId,
       answerId: button.dataset.answerId || "",
       answerStatus: button.dataset.answerStatus || "",
+      photoNoteId: button.dataset.photoNoteId || "",
       sourceItem: button.closest(".review-item"),
     };
+    if (action.entityType === "photo_note" && action.action === "edit_photo") {
+      openPhotoEditDialog(action);
+      return;
+    }
     if (actionNeedsReason(action.action)) openReasonDialog(action);
     else executeAction(action);
+  }
+
+  function openPhotoEditDialog(action) {
+    const row = state.rows.find((candidate) => candidate.id === action.entityId);
+    if (!row) {
+      showToast("这张照片已不在当前列表，请刷新后重试。", true);
+      return;
+    }
+    state.pendingPhotoEdit = { action, row };
+    elements.photoEditDirection.value = row.direction;
+    elements.photoEditQuestion.value = row.questionText;
+    elements.photoEditAnswer.value = row.answerText;
+    elements.photoEditAlt.value = row.altText;
+    elements.photoEditNote.value = row.internalNote;
+    elements.photoEditError.textContent = "";
+    elements.photoEditSave.disabled = false;
+    elements.photoEditDialog.showModal();
+    window.setTimeout(() => elements.photoEditQuestion.focus(), 30);
+  }
+
+  function readPhotoEditForm() {
+    return {
+      direction: elements.photoEditDirection.value,
+      questionText: elements.photoEditQuestion.value.trim(),
+      answerText: elements.photoEditAnswer.value.trim(),
+      altText: elements.photoEditAlt.value.trim(),
+      internalNote: elements.photoEditNote.value.trim(),
+    };
+  }
+
+  async function savePhotoEdit() {
+    const pending = state.pendingPhotoEdit;
+    if (!pending || !elements.photoEditForm.reportValidity()) return;
+    const patch = readPhotoEditForm();
+    if (!patch.questionText || !patch.answerText || !patch.altText) {
+      elements.photoEditError.textContent = "问题、回答和图片描述都需要填写。";
+      return;
+    }
+
+    elements.photoEditSave.disabled = true;
+    elements.photoEditSave.textContent = "保存中…";
+    elements.photoEditError.textContent = "";
+    try {
+      const updated = await photoNoteBackend.update(pending.row.id, patch);
+      const rowIndex = state.rows.findIndex((row) => row.id === pending.row.id);
+      if (rowIndex >= 0) state.rows[rowIndex] = updated || { ...state.rows[rowIndex], ...patch };
+      state.pendingPhotoEdit = null;
+      elements.photoEditDialog.close();
+      renderRows();
+      showToast("照片转写信息已保存。请确认无误后再发布。");
+    } catch (error) {
+      elements.photoEditError.textContent = error.message || "照片信息保存失败，请重试。";
+    } finally {
+      elements.photoEditSave.disabled = false;
+      elements.photoEditSave.textContent = "保存信息";
+    }
+  }
+
+  function setPhotoCaptureStatus(message, isError = false) {
+    elements.photoCaptureStatus.textContent = message;
+    elements.photoCaptureStatus.classList.toggle("is-error", isError);
+  }
+
+  function updatePhotoPreviewTransform() {
+    const rotation = ((state.photoRotation % 360) + 360) % 360;
+    const quarterTurn = rotation === 90 || rotation === 270;
+    elements.photoPreview.style.transform = `rotate(${rotation}deg) scale(${quarterTurn ? 0.75 : 1})`;
+  }
+
+  function resetPhotoSelection({ resetForm = false } = {}) {
+    if (state.photoPreviewUrl) URL.revokeObjectURL(state.photoPreviewUrl);
+    state.photoFile = null;
+    state.photoSource = "";
+    state.photoPreviewUrl = "";
+    state.photoRotation = 0;
+    state.photoDraft = null;
+    elements.photoCameraInput.value = "";
+    elements.photoGalleryInput.value = "";
+    elements.photoPreview.removeAttribute("src");
+    elements.photoPreview.hidden = true;
+    elements.photoPreview.style.transform = "";
+    elements.photoEmptyState.hidden = false;
+    elements.photoEditActions.hidden = true;
+    elements.photoCaptureStage.dataset.state = "empty";
+    elements.photoFileMeta.textContent = "";
+    setPhotoCaptureStatus("");
+    if (resetForm) {
+      elements.photoMetadataForm.reset();
+      [elements.photoQuestionCount, elements.photoAnswerCount, elements.photoAltCount, elements.photoNoteCount]
+        .forEach((counter) => { counter.textContent = "0"; });
+    }
+  }
+
+  function usePhotoFile(file, source) {
+    if (!file) return;
+    if (file.type && !file.type.startsWith("image/")) {
+      setPhotoCaptureStatus("请选择照片文件。", true);
+      return;
+    }
+    if (file.size > maxPhotoBytes) {
+      setPhotoCaptureStatus("照片不能超过 20 MB，请在系统相册中缩小后重试。", true);
+      return;
+    }
+    if (state.photoPreviewUrl) URL.revokeObjectURL(state.photoPreviewUrl);
+    state.photoFile = file;
+    state.photoSource = source;
+    state.photoRotation = 0;
+    state.photoDraft = null;
+    state.photoPreviewUrl = URL.createObjectURL(file);
+    elements.photoPreview.src = state.photoPreviewUrl;
+    elements.photoPreview.hidden = false;
+    elements.photoEmptyState.hidden = true;
+    elements.photoEditActions.hidden = false;
+    elements.photoCaptureStage.dataset.state = "filled";
+    elements.photoFileMeta.textContent = `${source === "camera" ? "相机拍摄" : "相册选择"} · ${formatFileSize(file.size)} · 上传前会自动压缩并清除拍摄信息`;
+    updatePhotoPreviewTransform();
+    setPhotoCaptureStatus("");
+  }
+
+  function loadImageForEncoding(file) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      const url = URL.createObjectURL(file);
+      image.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(image);
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("这张照片暂时无法读取，请换一张 JPG、PNG 或系统相机照片。"));
+      };
+      image.src = url;
+    });
+  }
+
+  function canvasToJpeg(canvas, quality = photoOutputQuality) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error("照片处理失败，请释放一些设备存储后重试。"));
+      }, "image/jpeg", quality);
+    });
+  }
+
+  async function encodeSelectedPhoto() {
+    if (!state.photoFile) throw new Error("请先拍照或从相册选择一张照片。");
+    const image = await loadImageForEncoding(state.photoFile);
+    const rotation = ((state.photoRotation % 360) + 360) % 360;
+    const quarterTurn = rotation === 90 || rotation === 270;
+    const rotatedWidth = quarterTurn ? image.naturalHeight : image.naturalWidth;
+    const rotatedHeight = quarterTurn ? image.naturalWidth : image.naturalHeight;
+    const scale = Math.min(1, maxPhotoDimension / Math.max(rotatedWidth, rotatedHeight));
+    const drawWidth = Math.max(1, Math.round(image.naturalWidth * scale));
+    const drawHeight = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = quarterTurn ? drawHeight : drawWidth;
+    canvas.height = quarterTurn ? drawWidth : drawHeight;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("当前浏览器无法处理照片，请更新浏览器后重试。");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    if (rotation === 90) {
+      context.translate(canvas.width, 0);
+      context.rotate(Math.PI / 2);
+    } else if (rotation === 180) {
+      context.translate(canvas.width, canvas.height);
+      context.rotate(Math.PI);
+    } else if (rotation === 270) {
+      context.translate(0, canvas.height);
+      context.rotate(-Math.PI / 2);
+    }
+    context.drawImage(image, 0, 0, drawWidth, drawHeight);
+    let blob = await canvasToJpeg(canvas);
+    if (blob.size > maxEncodedPhotoBytes) blob = await canvasToJpeg(canvas, 0.68);
+    if (blob.size > maxEncodedPhotoBytes) {
+      throw new Error("照片处理后仍然过大，请在系统相册中适当裁剪后重试。");
+    }
+    canvas.width = 1;
+    canvas.height = 1;
+    return { blob, width: quarterTurn ? drawHeight : drawWidth, height: quarterTurn ? drawWidth : drawHeight };
+  }
+
+  function readPhotoMetadata() {
+    return {
+      direction: elements.photoDirection.value,
+      questionText: elements.photoQuestionText.value.trim(),
+      answerText: elements.photoAnswerText.value.trim(),
+      altText: elements.photoAltText.value.trim(),
+      internalNote: elements.photoInternalNote.value.trim(),
+      rotationDegrees: 0,
+    };
+  }
+
+  function setPhotoCaptureBusy(isBusy, label = "确认并提交待审") {
+    state.photoSubmitting = isBusy;
+    elements.photoSubmitButton.disabled = isBusy;
+    elements.photoCameraButton.disabled = isBusy;
+    elements.photoGalleryButton.disabled = isBusy;
+    elements.photoEditActions.querySelectorAll("button").forEach((button) => { button.disabled = isBusy; });
+    elements.photoProcessing.hidden = !isBusy;
+    elements.photoSubmitButton.textContent = isBusy ? label : "确认并提交待审";
+  }
+
+  async function submitPhotoNote() {
+    if (state.photoSubmitting) return;
+    if (!state.photoFile) {
+      setPhotoCaptureStatus("请先拍下或选择实体便签照片。", true);
+      elements.photoCameraButton.focus();
+      return;
+    }
+    if (!elements.photoMetadataForm.reportValidity()) {
+      setPhotoCaptureStatus("请补全转写、图片描述和隐私确认。", true);
+      return;
+    }
+    const metadata = readPhotoMetadata();
+    if (!metadata.questionText || !metadata.answerText || !metadata.altText) {
+      setPhotoCaptureStatus("问题、回答和图片描述都需要填写。", true);
+      return;
+    }
+
+    setPhotoCaptureBusy(true, "正在处理照片…");
+    setPhotoCaptureStatus("正在压缩照片并清除拍摄信息，请不要关闭页面。");
+    try {
+      let draft = state.photoDraft;
+      if (!draft) {
+        const encoded = await encodeSelectedPhoto();
+        const created = await photoNoteBackend.createDraft(metadata);
+        if (!created.note?.id || !created.upload) throw new Error("待审记录创建失败，请重试。");
+        draft = {
+          id: created.note.id,
+          blob: encoded.blob,
+          width: encoded.width,
+          height: encoded.height,
+          upload: created.upload,
+          uploaded: false,
+        };
+        state.photoDraft = draft;
+      }
+
+      if (!draft.uploaded) {
+        setPhotoCaptureBusy(true, "正在安全上传…");
+        setPhotoCaptureStatus(`正在上传处理后的照片（${formatFileSize(draft.blob.size)}）…`);
+        if (!draft.upload?.signedUrl) draft.upload = await photoNoteBackend.refreshUpload(draft.id);
+        try {
+          await photoNoteBackend.upload(draft.upload, draft.blob);
+        } catch (uploadError) {
+          draft.upload = null;
+          throw uploadError;
+        }
+        draft.uploaded = true;
+        draft.upload = null;
+      }
+
+      setPhotoCaptureBusy(true, "正在进入待审队列…");
+      setPhotoCaptureStatus("照片已安全上传，正在写入待审队列…");
+      let note;
+      try {
+        note = await photoNoteBackend.completeDraft(
+          draft.id,
+          { width: draft.width, height: draft.height },
+          metadata,
+        );
+      } catch (completeError) {
+        const actual = await photoNoteBackend.get(draft.id).catch(() => null);
+        if (actual?.status !== "pending") throw completeError;
+        note = actual;
+      }
+      if (note?.status !== "pending") throw new Error("照片已保存，但待审状态尚未确认，请刷新审核队列。");
+      state.photoDraft = null;
+      setPhotoCaptureStatus("已提交，正在打开照片审核队列。");
+      showToast("实体便签已进入私有待审队列。");
+      resetPhotoSelection({ resetForm: true });
+      state.photoStatus = "pending";
+      elements.photoStatus.value = "pending";
+      selectView("photo_notes");
+    } catch (error) {
+      const uploadedHint = state.photoDraft?.uploaded ? "照片已安全上传；再次点提交会继续入审，不会重复上传。" : "照片和已填写文字仍保留在本页。";
+      setPhotoCaptureStatus(`${error.message || "提交失败，请重试。"} ${uploadedHint}`, true);
+    } finally {
+      setPhotoCaptureBusy(false);
+    }
   }
 
   function setRuntimeFormStatus(message, isError = false) {
@@ -1087,6 +1753,72 @@
     void refreshWorkspace();
   });
 
+  elements.photoStatus.addEventListener("change", () => {
+    state.photoStatus = elements.photoStatus.value;
+    void refreshWorkspace();
+  });
+
+  elements.photoCameraButton.addEventListener("click", () => {
+    if (!state.photoSubmitting) elements.photoCameraInput.click();
+  });
+
+  elements.photoGalleryButton.addEventListener("click", () => {
+    if (!state.photoSubmitting) elements.photoGalleryInput.click();
+  });
+
+  elements.photoCameraInput.addEventListener("change", () => {
+    usePhotoFile(elements.photoCameraInput.files?.[0], "camera");
+  });
+
+  elements.photoGalleryInput.addEventListener("change", () => {
+    usePhotoFile(elements.photoGalleryInput.files?.[0], "gallery");
+  });
+
+  elements.photoPreview.addEventListener("load", () => {
+    if (!state.photoFile) return;
+    const dimensions = elements.photoPreview.naturalWidth && elements.photoPreview.naturalHeight
+      ? ` · ${elements.photoPreview.naturalWidth} × ${elements.photoPreview.naturalHeight}`
+      : "";
+    elements.photoFileMeta.textContent = `${state.photoSource === "camera" ? "相机拍摄" : "相册选择"} · ${formatFileSize(state.photoFile.size)}${dimensions} · 上传前会自动压缩并清除拍摄信息`;
+  });
+
+  elements.photoPreview.addEventListener("error", () => {
+    setPhotoCaptureStatus("照片预览失败，请换一张 JPG、PNG 或系统相机照片。", true);
+  });
+
+  elements.photoEditActions.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-photo-edit]");
+    if (!button || state.photoSubmitting) return;
+    if (button.dataset.photoEdit === "retake") {
+      resetPhotoSelection();
+      elements.photoCameraButton.focus();
+      return;
+    }
+    const delta = button.dataset.photoEdit === "rotate-left" ? -90 : 90;
+    state.photoRotation = (state.photoRotation + delta + 360) % 360;
+    state.photoDraft = null;
+    updatePhotoPreviewTransform();
+    setPhotoCaptureStatus(`已旋转 ${state.photoRotation}°，提交时会按当前方向保存。`);
+  });
+
+  [
+    [elements.photoQuestionText, elements.photoQuestionCount],
+    [elements.photoAnswerText, elements.photoAnswerCount],
+    [elements.photoAltText, elements.photoAltCount],
+    [elements.photoInternalNote, elements.photoNoteCount],
+  ].forEach(([field, counter]) => {
+    field.addEventListener("input", () => {
+      counter.textContent = String(field.value.length);
+      setPhotoCaptureStatus("");
+    });
+  });
+
+  elements.photoMetadataForm.addEventListener("change", () => setPhotoCaptureStatus(""));
+  elements.photoMetadataForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitPhotoNote();
+  });
+
   elements.refreshButton.addEventListener("click", () => { void refreshWorkspace(); });
   elements.loadMoreButton.addEventListener("click", () => { void loadMoreRows(); });
   elements.logoutButton.addEventListener("click", () => { void signOut(); });
@@ -1120,6 +1852,24 @@
 
   elements.reasonDialog.addEventListener("cancel", () => {
     state.pendingAction = null;
+  });
+
+  document.querySelector("[data-photo-edit-cancel]").addEventListener("click", () => {
+    state.pendingPhotoEdit = null;
+    elements.photoEditDialog.close();
+  });
+
+  elements.photoEditDialog.addEventListener("cancel", () => {
+    state.pendingPhotoEdit = null;
+  });
+
+  elements.photoEditForm.addEventListener("input", () => {
+    elements.photoEditError.textContent = "";
+  });
+
+  elements.photoEditForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void savePhotoEdit();
   });
 
   elements.reasonForm.addEventListener("submit", (event) => {
@@ -1173,6 +1923,10 @@
     if (state.session) await initializeAuthenticatedView();
     else showLogin();
   }
+
+  window.addEventListener("beforeunload", () => {
+    if (state.photoPreviewUrl) URL.revokeObjectURL(state.photoPreviewUrl);
+  });
 
   start();
 })();
