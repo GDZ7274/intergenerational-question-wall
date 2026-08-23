@@ -1,33 +1,55 @@
-# Supabase schema v3 与审核后台
+# Supabase schema v4 与审核后台
 
-本目录按顺序提供四次数据库迁移：
+本目录按顺序提供五次数据库迁移：
 
 1. `migrations/0001_experience.sql`：业务表、公开视图、基础约束与种子问答。
 2. `migrations/0002_moderation.sql`：待审核状态、管理员白名单、审核 RPC 与操作日志。
 3. `migrations/0003_operational_controls.sql`：受控投稿 RPC、恢复码、状态事件、数据库限流与运营开关。
 4. `migrations/0004_release_hardening.sql`：冲突安全的历史会话指纹迁移、驳回理由约束、完整审核反馈事件、共享网络额度优化与上线探针。
+5. `migrations/0005_photo_notes.sql`：工作人员采集的实体便签、私有待审/公开媒体桶、统一公开墙、照片举报与审核审计。
 
 `0003` 会撤销 `anon` 和 `authenticated` 对 `questions`、`answers`、`reports` 的直接插入权限。公开写入只能通过 `SECURITY DEFINER` RPC，不能再按 schema v2 的方式直接写底表。
 
 ## 执行与检查
 
 1. 新建 Supabase 项目。
-2. 打开 SQL Editor，依次完整执行 `0001_experience.sql`、`0002_moderation.sql`、`0003_operational_controls.sql`、`0004_release_hardening.sql`，不要颠倒顺序。已有 schema v2 项目继续执行 `0003` 和 `0004`；已执行 v3 的项目补跑 `0004`。
+2. 打开 SQL Editor，依次完整执行 `0001_experience.sql`、`0002_moderation.sql`、`0003_operational_controls.sql`、`0004_release_hardening.sql`、`0005_photo_notes.sql`，不要颠倒顺序。已运行 schema v3 的项目只需继续执行 `0005`。
 3. 在 Authentication 中预先创建并确认管理员用户，再把其 `auth.users.id` 私下写入 `moderator_accounts`。
-4. 确认以下对象存在：业务与管理表、v3 控制表 `runtime_settings` / `submission_receipts` / `submission_events` / `abuse_rate_buckets`、公开视图 `wall_notes` / `question_pool`，以及私有 helper schema `question_wall_private`。
-5. 调用 `moderation_status()`，确认返回 `schemaVersion: 3`、`hardeningVersion: 1` 与 `submissionsRequireReview: true`。
+4. 确认以下对象存在：业务与管理表、控制表 `runtime_settings` / `submission_receipts` / `submission_events` / `abuse_rate_buckets`、照片表 `photo_notes`、公开视图 `wall_notes` / `question_pool`，以及私有 helper schema `question_wall_private`。
+5. 确认 Storage 中存在私有桶 `photo-note-staging` 与公开桶 `photo-note-public`；这两个桶不应有允许 `anon` 或普通 `authenticated` 用户写入的额外策略。
+6. 部署 `functions/photo-note-media`，保持 JWT 校验开启，并将正式站点与本地验收地址写入函数环境变量 `PHOTO_NOTE_ALLOWED_ORIGINS`（逗号分隔）。
+7. 调用 `moderation_status()`，确认返回 `schemaVersion: 4`、`hardeningVersion: 1`、`photoNotesEnabled: true` 与 `photoUploadMode: moderator_only`。
 
 前台不需要启用 Supabase Anonymous Sign-Ins。浏览器使用 publishable key（旧界面中的 `anon public` key）；这个 key 会公开出现在页面中，真正的安全边界由 RLS、权限收窄和 RPC 内部校验共同构成。
 
 ## 权限边界
 
-- `anon` 与 `authenticated` 可直接 `SELECT` 的只有 `wall_notes`、`question_pool`，不能读取业务底表或 v3 控制表。
-- 公共角色只能执行下文列出的公共 RPC，不能直接向三张业务表 `INSERT`。
+- `anon` 与普通 `authenticated` 可直接 `SELECT` 的只有 `wall_notes`、`question_pool`，不能读取业务底表、控制表或 `photo_notes`。
+- 公共角色只能执行下文列出的公共 RPC，不能直接向四张业务表 `INSERT`。
 - 前端会话 ID 在入库前转换为带命名空间的 SHA-256 指纹；数据库不保存原始会话 ID。它仍是可伪造的匿名标识，不是登录身份。
 - `authenticated` 身份本身不具有后台权限。管理 RPC 还会检查 JWT 中的 UUID 是否位于 `moderator_accounts` 且 `enabled = true`。
 - `service_role` key、数据库密码、管理员 UUID 和登录令牌都不得写入网页、GitHub 仓库或 Actions 变量。
 
-公开视图不会返回会话指纹、来源、审核字段或恢复码。`note_id` 等于对应的 `answers.id`，举报使用这个 UUID 关联便签。
+公开视图不会返回会话指纹、来源、审核字段、内部备注或恢复码。文字便签的 `note_id` 等于 `answers.id`；实体便签的 `note_id` 等于 `photo_notes.id`。举报统一使用公开 `note_id`，数据库会同时记录 `note_kind`。
+
+## 实体便签媒体链路
+
+实体便签只开放给已登录且列入 `moderator_accounts` 的工作人员，不提供匿名上传。采集端先把照片在浏览器中旋转、压缩并重新编码，再调用 `photo-note-media`：
+
+1. `createDraft` 创建数据库草稿并返回约两小时有效的单对象上传地址。
+2. 浏览器把 JPEG/PNG/WebP 直接 `PUT` 到该地址；地址只允许写入当前草稿的私有路径。
+3. `completeDraft` 从 Storage 重新读取文件并校验文件头、实际字节数和常见 EXIF 元数据标记，再把草稿送入 `pending`。
+4. `preview` 返回十分钟有效的私有预览地址。
+5. `publish` 由服务端把待审文件复制到公开桶，并在数据库审核通过失败时自动清理刚写入的公开对象；隐藏后的重新发布也使用这个动作并生成新路径。
+6. `hide` 先让数据库停止公开投影，再尽力删除公开对象。若删除失败，响应中的 `mediaRemoved` 为 `false`，应重试 `removeHiddenPublicMedia`。
+
+函数请求使用管理后台的访问令牌，URL 为 `<SUPABASE_URL>/functions/v1/photo-note-media`，正文均为 JSON。不要把 `SUPABASE_SERVICE_ROLE_KEY` 写入网页、仓库、Actions 日志或函数响应。
+
+公开图片使用一年不可变缓存以保证移动端浏览性能。下架会阻止墙面继续返回它并删除源对象，但无法召回访客设备、代理或分享平台已经缓存的副本；工作人员在发布前仍必须完成肖像、隐私和监护授权检查。私有草稿和驳回件也需要在正式运营时配置保留期限与定期清理任务。
+
+`wall_notes` 保留原有前九列并追加：`kind`、`photo_note_id`、`media_bucket`、`media_path`、`alt_text`、`media_width`、`media_height`。文字行 `kind=text` 且照片字段为空；照片行 `kind=photo` 且 `question_id` / `answer_id` 为空。前端应由可信的 Supabase 基础 URL、固定公开桶名和编码后的 `media_path` 组成图片 URL，不应直接信任任意外部媒体地址。
+
+照片管理 RPC 包括 `admin_create_photo_note`、`admin_get_photo_note`、`admin_update_photo_note`、`admin_submit_photo_note`、`admin_list_photo_notes` 与 `admin_moderate_photo_note`。审核动作支持 `approve`、`reject`、`hide`、`publish`、`feature` 与 `unfeature`，并全部写入 `moderation_actions`。
 
 ## 公共前端契约
 

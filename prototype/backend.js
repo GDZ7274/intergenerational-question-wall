@@ -68,17 +68,44 @@
     return payload;
   }
 
+  function publicStorageUrl(bucket, objectPath) {
+    const cleanBucket = typeof bucket === "string" ? bucket.trim() : "";
+    const cleanPath = typeof objectPath === "string" ? objectPath.trim() : "";
+    const pathSegments = cleanPath.split("/");
+    if (
+      cleanBucket !== "photo-note-public" ||
+      !cleanPath ||
+      pathSegments.some((segment) => !segment || segment === "." || segment === ".." || /[\\\u0000-\u001f]/.test(segment))
+    ) {
+      return "";
+    }
+    return `${supabaseUrl}/storage/v1/object/public/${encodeURIComponent(cleanBucket)}/${pathSegments.map(encodeURIComponent).join("/")}`;
+  }
+
   function mapNote(row) {
+    const kind = row.kind === "photo" ? "photo" : "text";
+    const mediaBucket = kind === "photo" ? String(row.media_bucket || "") : "";
+    const mediaPath = kind === "photo" ? String(row.media_path || "") : "";
+    const mediaUrl = publicStorageUrl(mediaBucket, mediaPath);
     return {
       id: row.note_id,
+      kind,
       questionId: row.question_id,
       answerId: row.answer_id,
+      photoNoteId: row.photo_note_id || null,
       direction: row.direction,
       question: row.question,
       answer: row.answer,
       createdAt: row.published_at,
       featured: Boolean(row.featured),
       answerCount: Number(row.answer_count || 1),
+      mediaBucket: mediaBucket || null,
+      mediaPath: mediaPath || null,
+      mediaUrl: mediaUrl || null,
+      imageUrl: mediaUrl || null,
+      altText: typeof row.alt_text === "string" ? row.alt_text : "",
+      mediaWidth: Number(row.media_width || 0) || null,
+      mediaHeight: Number(row.media_height || 0) || null,
     };
   }
 
@@ -128,13 +155,17 @@
 
   async function loadRuntimeStatus() {
     const status = await rpc("public_runtime_status");
-    return {
+    const normalized = {
       schemaVersion: Number(status?.schemaVersion || 0),
       submissionsPaused: Boolean(status?.submissionsPaused),
       readOnly: Boolean(status?.readOnly),
       emergencyLockdown: Boolean(status?.emergencyLockdown),
       publicMessage: typeof status?.publicMessage === "string" ? status.publicMessage : "",
     };
+    if (Object.prototype.hasOwnProperty.call(status || {}, "photoNotesEnabled")) {
+      normalized.photoNotesEnabled = Boolean(status.photoNotesEnabled);
+    }
+    return normalized;
   }
 
   async function createQuestion({ authorSessionId, authorRole, body, anonymous }) {
