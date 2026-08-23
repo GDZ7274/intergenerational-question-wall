@@ -213,7 +213,7 @@ admin_moderate_photo_note
 
 前台以 20 秒为间隔轮询 `public_runtime_status`；页面得到 focus、online 或重新 visible 时也同步。状态改变后再拉取公开内容，发布内容可进入墙，已下架内容会从墙、推荐队列、近期回看、收藏校验和打开的详情/分享层移除。内容签名未变化时不重置浏览结束状态。没有实时订阅。
 
-收藏在本机按最近操作排序并保存小型快照；联网时通过 `wall_notes` 重新校验公开状态。分享面板可生成文字便签 PNG，或读取照片便签公开原图，支持系统分享、下载和复制带 `?note=` 的直接链接；打开链接会再次复核公开状态。
+收藏在本机按最近操作排序并保存小型快照；联网时通过 `wall_notes` 重新校验公开状态。分享面板可生成文字便签 PNG，或读取照片便签公开原图；生成后的 Blob 同时用于保存前预览、系统分享和下载，预览对象地址在面板关闭或内容失效时释放。面板也可复制带 `?note=` 的直接链接；打开链接会再次复核公开状态。
 
 ## 10. 运行与发布约束
 
@@ -221,7 +221,7 @@ admin_moderate_photo_note
 - 完整 schema v4 才启用照片能力。生产必须顺序应用 `0001_experience.sql`、`0002_moderation.sql`、`0003_operational_controls.sql`、`0004_release_hardening.sql`、`0005_photo_notes.sql`、`0006_photo_media_service_boundary.sql`，并部署 `photo-note-media`；已是 schema v3 的项目必须继续执行 `0005` 和 `0006`。
 - Pages 将完整 v4 识别为 `schemaVersion = 4`、`hardeningVersion = 1`、`submissionsRequireReview = true`、`photoNotesEnabled = true`、`photoUploadMode = moderator_only`、`photoMediaServiceBoundaryVersion = 1`。只有此时才验证 `wall_notes` 的照片投影，以及 Edge Function 对 Pages origin 的 CORS；探针成功后照片后台和公开照片能力才可用。部署函数前必须设置 `PHOTO_NOTE_ALLOWED_ORIGINS`；生产 origin 只写协议与主机，不含仓库路径。
 - `supabase-release` 支持手动 preflight/deploy，也会响应唯一 `supabase-v*` 标签。标签路径固定为 deploy，仍先 dry run 并在发现会重放 `0001` 至 `0004` 时拒绝；所有生产写入都受 `supabase-production` Environment 审批。推荐先将功能提交推送到功能分支并打标签，后端成功后再合并或推送 `main` 发布 Pages。
-- 静态页面 CSP 限制脚本样式为同源，连接目标为同源和托管 Supabase；Lucide 使用项目内 vendor 文件。当前资源缓存版本为 styles v22、app v23、backend v5、admin v8；改动资源时须同步更新 HTML 查询参数。
+- 静态页面 CSP 限制脚本样式为同源，连接目标为同源和托管 Supabase；Lucide 使用项目内 vendor 文件。当前资源缓存版本为 styles v23、app v24、backend v5、admin v8；改动资源时须同步更新 HTML 查询参数。
 - Pages 工作流运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs`。Pages 回滚不会回滚数据库迁移、Storage 或 Edge Function。
 
 ## 11. 未来规划（未实现）
