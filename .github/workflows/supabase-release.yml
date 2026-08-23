@@ -82,6 +82,22 @@ jobs:
           }
           NODE
 
+      - name: Derive safe public configuration
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const urlValue = (process.env.SUPABASE_URL || "").trim();
+          if (!urlValue) process.exit(0);
+          const projectUrl = new URL(urlValue);
+          const derivedProjectRef = projectUrl.hostname.split(".")[0];
+          const projectRef = (process.env.SUPABASE_PROJECT_REF || "").trim() || derivedProjectRef;
+          const origins = (process.env.PHOTO_NOTE_ALLOWED_ORIGINS || "").trim() ||
+            `https://${String(process.env.GITHUB_REPOSITORY_OWNER || "").toLowerCase()}.github.io`;
+          fs.appendFileSync(process.env.GITHUB_ENV, `SUPABASE_PROJECT_REF=${projectRef}\n`);
+          fs.appendFileSync(process.env.GITHUB_ENV, `PHOTO_NOTE_ALLOWED_ORIGINS=${origins}\n`);
+          NODE
+
       - name: Validate protected configuration
         shell: bash
         run: |
@@ -94,8 +110,10 @@ jobs:
             "SUPABASE_ANON_KEY",
             "PHOTO_NOTE_ALLOWED_ORIGINS",
           ];
-          for (const name of required) {
-            if (!(process.env[name] || "").trim()) throw new Error(`Missing protected setting: ${name}`);
+          const missing = required.filter((name) => !(process.env[name] || "").trim());
+          if (missing.length) {
+            console.error(`::error title=Protected configuration missing::${missing.join(", ")}`);
+            process.exit(1);
           }
 
           if (!/^[a-z0-9]{20}$/.test(process.env.SUPABASE_PROJECT_REF.trim())) {

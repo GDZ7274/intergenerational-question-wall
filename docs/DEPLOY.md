@@ -93,8 +93,8 @@ git push -u origin main
 
 | 类型 | 名称 | 用途 |
 | --- | --- | --- |
-| Variable | `SUPABASE_PROJECT_REF` | 20 位项目 ref，不是完整 URL |
-| Variable | `PHOTO_NOTE_ALLOWED_ORIGINS` | 允许调用媒体函数的网页 origin，逗号分隔 |
+| Variable（可选） | `SUPABASE_PROJECT_REF` | 20 位项目 ref；未填时由 `SUPABASE_URL` 的主机名推导 |
+| Variable（可选） | `PHOTO_NOTE_ALLOWED_ORIGINS` | 允许调用媒体函数的网页 origin；未填时使用仓库所有者的 GitHub Pages origin |
 | Secret | `SUPABASE_ACCESS_TOKEN` | 仅供 Supabase CLI 发布，不进入前端 artifact |
 | Secret | `SUPABASE_DB_PASSWORD` | 仅供迁移连接，不进入前端 artifact |
 
