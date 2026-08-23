@@ -1,0 +1,238 @@
+name: Release Supabase schema and photo media function
+
+on:
+  push:
+    tags:
+      - "supabase-v*"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run a read-only preflight or deploy to the protected environment (tag releases always deploy)
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - deploy
+      migration_history_confirmed:
+        description: I verified that remote migration history already records 0001-0004
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-production
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: supabase-production
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+      PHOTO_NOTE_ALLOWED_ORIGINS: ${{ vars.PHOTO_NOTE_ALLOWED_ORIGINS }}
+      RELEASE_MODE: ${{ github.ref_type == 'tag' && 'deploy' || inputs.mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Validate release files
+        shell: bash
+        run: |
+          node --check prototype/backend.js
+          node --check prototype/admin.js
+          node --test tests/*.test.mjs
+          test -f supabase/migrations/0005_photo_notes.sql
+          test -f supabase/migrations/0006_photo_media_service_boundary.sql
+          test -f supabase/functions/photo-note-media/index.ts
+          node <<'NODE'
+          const fs = require("node:fs");
+          const source = fs.readFileSync("supabase/functions/photo-note-media/index.ts", "utf8");
+          for (const marker of [
+            'requiredEnvironment("SUPABASE_SERVICE_ROLE_KEY")',
+            'userClient.rpc("admin_whoami")',
+            '.createSignedUploadUrl(',
+            '.createSignedUrl(',
+            'assertAllowedOrigin(request)',
+            'p_action: "clear_media"',
+            'case "createDraft"',
+            'case "refreshUpload"',
+            'case "completeDraft"',
+            'case "preview"',
+            'case "publish"',
+            'case "hide"',
+            'case "removeHiddenPublicMedia"',
+            'case "hideReportedPhoto"',
+          ]) {
+            if (!source.includes(marker)) throw new Error(`Missing photo media contract: ${marker}`);
+          }
+          NODE
+
+      - name: Validate protected configuration
+        shell: bash
+        run: |
+          node <<'NODE'
+          const required = [
+            "SUPABASE_ACCESS_TOKEN",
+            "SUPABASE_DB_PASSWORD",
+            "SUPABASE_PROJECT_REF",
+            "SUPABASE_URL",
+            "SUPABASE_ANON_KEY",
+            "PHOTO_NOTE_ALLOWED_ORIGINS",
+          ];
+          for (const name of required) {
+            if (!(process.env[name] || "").trim()) throw new Error(`Missing protected setting: ${name}`);
+          }
+
+          if (!/^[a-z0-9]{20}$/.test(process.env.SUPABASE_PROJECT_REF.trim())) {
+            throw new Error("SUPABASE_PROJECT_REF has an unexpected format.");
+          }
+          const projectUrl = new URL(process.env.SUPABASE_URL.trim());
+          if (projectUrl.protocol !== "https:" || !projectUrl.hostname.endsWith(".supabase.co")) {
+            throw new Error("SUPABASE_URL must be an HTTPS hosted Supabase project URL.");
+          }
+          const origins = process.env.PHOTO_NOTE_ALLOWED_ORIGINS
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean);
+          if (!origins.length) throw new Error("At least one photo-note origin is required.");
+          for (const origin of origins) {
+            const parsed = new URL(origin);
+            const local = ["localhost", "127.0.0.1"].includes(parsed.hostname);
+            if (parsed.origin !== origin || (parsed.protocol !== "https:" && !local)) {
+              throw new Error(`Invalid allowed origin: ${origin}`);
+            }
+          }
+          NODE
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Initialize and link project
+        shell: bash
+        run: |
+          if [[ ! -f supabase/config.toml ]]; then
+            supabase init
+          fi
+          supabase link --project-ref "${SUPABASE_PROJECT_REF}"
+
+      - name: Show migration history and dry run
+        shell: bash
+        run: |
+          supabase migration list --linked
+          DRY_RUN_FILE="$(mktemp)"
+          trap 'rm -f "${DRY_RUN_FILE}"' EXIT
+          supabase db push --linked --include-all --dry-run 2>&1 | tee "${DRY_RUN_FILE}"
+          if [[ "${RELEASE_MODE}" == "deploy" ]] && grep --extended-regexp --quiet \
+            '0001_experience|0002_moderation|0003_operational_controls|0004_release_hardening' \
+            "${DRY_RUN_FILE}"; then
+            echo "Deployment refused: the dry run would replay a pre-v4 migration." >&2
+            echo "Repair and verify remote migration history, then run preflight again." >&2
+            exit 1
+          fi
+
+      - name: Require explicit migration-history confirmation
+        if: ${{ env.RELEASE_MODE == 'deploy' && github.ref_type != 'tag' && inputs.migration_history_confirmed != true }}
+        shell: bash
+        run: |
+          echo "Deployment refused: verify that 0001-0004 are recorded in remote migration history first." >&2
+          exit 1
+
+      - name: Apply pending migrations
+        if: ${{ env.RELEASE_MODE == 'deploy' && (github.ref_type == 'tag' || inputs.migration_history_confirmed == true) }}
+        shell: bash
+        run: supabase db push --linked --include-all --yes
+
+      - name: Configure photo media origins
+        if: ${{ env.RELEASE_MODE == 'deploy' && (github.ref_type == 'tag' || inputs.migration_history_confirmed == true) }}
+        shell: bash
+        run: |
+          supabase secrets set \
+            --project-ref "${SUPABASE_PROJECT_REF}" \
+            PHOTO_NOTE_ALLOWED_ORIGINS="${PHOTO_NOTE_ALLOWED_ORIGINS}"
+
+      - name: Deploy photo media function
+        if: ${{ env.RELEASE_MODE == 'deploy' && (github.ref_type == 'tag' || inputs.migration_history_confirmed == true) }}
+        shell: bash
+        run: |
+          supabase functions deploy photo-note-media \
+            --project-ref "${SUPABASE_PROJECT_REF}"
+
+      - name: Verify schema v4
+        if: ${{ env.RELEASE_MODE == 'deploy' && (github.ref_type == 'tag' || inputs.migration_history_confirmed == true) }}
+        shell: bash
+        run: |
+          MODERATION_STATUS="$(
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "apikey: ${SUPABASE_ANON_KEY}" \
+              --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+              --header "Content-Type: application/json" \
+              --data '{}' \
+              "${SUPABASE_URL}/rest/v1/rpc/moderation_status"
+          )"
+          export MODERATION_STATUS
+          node <<'NODE'
+          const status = JSON.parse(process.env.MODERATION_STATUS || "null");
+          if (
+            status?.schemaVersion !== 4 ||
+            status?.hardeningVersion !== 1 ||
+            status?.submissionsRequireReview !== true ||
+            status?.photoNotesEnabled !== true ||
+            status?.photoUploadMode !== "moderator_only" ||
+            status?.photoMediaServiceBoundaryVersion !== 1
+          ) {
+            throw new Error("Remote Supabase schema-v4 probe failed.");
+          }
+          NODE
+          curl --fail --silent --show-error \
+            --header "apikey: ${SUPABASE_ANON_KEY}" \
+            --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            "${SUPABASE_URL}/rest/v1/wall_notes?select=note_id,kind,photo_note_id,media_bucket,media_path,alt_text,media_width,media_height&limit=1" \
+            >/dev/null
+
+      - name: Verify photo media function
+        if: ${{ env.RELEASE_MODE == 'deploy' && (github.ref_type == 'tag' || inputs.migration_history_confirmed == true) }}
+        shell: bash
+        run: |
+          PROBE_ORIGIN="$(
+            node -e 'process.stdout.write(process.env.PHOTO_NOTE_ALLOWED_ORIGINS.split(",")[0].trim())'
+          )"
+          HEADERS_FILE="$(mktemp)"
+          trap 'rm -f "${HEADERS_FILE}"' EXIT
+          HTTP_STATUS="$(
+            curl --silent --show-error \
+              --output /dev/null \
+              --dump-header "${HEADERS_FILE}" \
+              --write-out '%{http_code}' \
+              --request OPTIONS \
+              --header "Origin: ${PROBE_ORIGIN}" \
+              --header "Access-Control-Request-Method: POST" \
+              --header "Access-Control-Request-Headers: authorization,apikey,content-type" \
+              "${SUPABASE_URL}/functions/v1/photo-note-media"
+          )"
+          if [[ "${HTTP_STATUS}" != "200" && "${HTTP_STATUS}" != "204" ]]; then
+            echo "photo-note-media preflight failed with HTTP ${HTTP_STATUS}." >&2
+            exit 1
+          fi
+          if ! grep --fixed-strings --ignore-case --quiet \
+            "access-control-allow-origin: ${PROBE_ORIGIN}" "${HEADERS_FILE}"; then
+            echo "photo-note-media did not return the configured CORS origin." >&2
+            exit 1
+          fi

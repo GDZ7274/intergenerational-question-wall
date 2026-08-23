@@ -5,9 +5,10 @@
 ```text
 手机浏览器 -> GitHub Pages 前台 -> Supabase REST API -> PostgreSQL + RLS
 管理员浏览器 -> GitHub Pages /admin.html -> Supabase Auth + 审核 RPC
+实体便签采集 -> 受鉴权 Edge Function -> 私有待审 Storage -> 公开媒体 Storage
 ```
 
-GitHub Pages 负责发布 `prototype/` 中的静态文件；Supabase 负责数据、管理员登录、审核权限和操作日志。浏览器只持有公开 publishable key，管理员操作使用登录后的短期 JWT；任何页面都不包含 `service_role` key。
+GitHub Pages 负责发布 `prototype/` 中的静态文件；Supabase 负责数据、管理员登录、审核权限、操作日志和实体便签媒体。浏览器只持有公开 publishable key，管理员操作使用登录后的短期 JWT；`service_role` 只存在于 Supabase Edge Function 的托管环境中，任何页面和 GitHub 配置都不包含它。
 
 ## 当前能力边界
 
@@ -18,6 +19,7 @@ GitHub Pages 负责发布 `prototype/` 中的静态文件；Supabase 负责数�
 - 为问题和回答签发恢复码，可轮询审核状态、在另一设备手动恢复，并修改重投被驳回内容。
 - 数据库通过状态字段和公开视图控制哪些内容出现在前台。
 - 管理员在 `admin.html` 审核问题与回答、处置举报、管理公开内容、查看操作记录与运行状态。
+- 白名单内工作人员可在移动端拍摄实体便签；浏览器重编码后通过短期单对象地址写入私有桶，审核通过才复制到公开桶并进入统一滑动墙。
 
 仍保存在当前浏览器的内容：
 
@@ -30,7 +32,7 @@ GitHub Pages 负责发布 `prototype/` 中的静态文件；Supabase 负责数�
 ## 1. 准备 Supabase
 
 1. 在 [Supabase](https://supabase.com/) 新建项目，并妥善保存数据库密码。
-2. 在项目的 **SQL Editor** 中依次运行 [`supabase/migrations/0001_experience.sql`](../supabase/migrations/0001_experience.sql)、[`supabase/migrations/0002_moderation.sql`](../supabase/migrations/0002_moderation.sql)、[`supabase/migrations/0003_operational_controls.sql`](../supabase/migrations/0003_operational_controls.sql) 和 [`supabase/migrations/0004_release_hardening.sql`](../supabase/migrations/0004_release_hardening.sql)。不要颠倒顺序；已有 schema v2 项目继续执行 `0003` 和 `0004`，已有 v3 项目补跑 `0004`。
+2. 在项目的 **SQL Editor** 中依次运行 [`supabase/migrations/0001_experience.sql`](../supabase/migrations/0001_experience.sql)、[`supabase/migrations/0002_moderation.sql`](../supabase/migrations/0002_moderation.sql)、[`supabase/migrations/0003_operational_controls.sql`](../supabase/migrations/0003_operational_controls.sql)、[`supabase/migrations/0004_release_hardening.sql`](../supabase/migrations/0004_release_hardening.sql)、[`supabase/migrations/0005_photo_notes.sql`](../supabase/migrations/0005_photo_notes.sql) 和 [`supabase/migrations/0006_photo_media_service_boundary.sql`](../supabase/migrations/0006_photo_media_service_boundary.sql)。不要颠倒顺序；已运行 schema v3 的项目只需继续执行 `0005` 和 `0006`。
 3. 在 **Project Settings > API** 中取得：
    - **Project URL**，格式类似 `https://xxxx.supabase.co`。
    - **Publishable key**；旧项目中可能显示为 `anon public` key。
@@ -48,9 +50,11 @@ GitHub Pages 负责发布 `prototype/` 中的静态文件；Supabase 负责数�
    - Redirect URL：`https://<你的用户名>.github.io/intergenerational-question-wall/admin.html`
 6. 保持 Email 登录启用，关闭公开注册。后台请求 Magic Link 时使用 `create_user: false`，所以管理员必须先存在于 Auth Users，且 UUID 位于启用的白名单中。
 7. 需要日常审核但不能切换运行状态的账号，将上例角色改为 `reviewer`；只有 `owner` 可修改暂停投稿、只读和紧急关闭。
-8. 在 Table Editor 中确认业务表、v3 控制表、公开视图、`moderator_accounts` 和 `moderation_actions` 已创建，再按 [`supabase/README.md`](../supabase/README.md) 验证权限与 RPC。
+8. 在 Table Editor 中确认业务表、控制表、`photo_notes`、公开视图、`moderator_accounts` 和 `moderation_actions` 已创建；在 Storage 中确认 `photo-note-staging` 为私有桶、`photo-note-public` 为公开桶。
+9. 部署 `photo-note-media` Edge Function，保持 JWT 校验开启，并必须设置 `PHOTO_NOTE_ALLOWED_ORIGINS`。未配置、请求缺少 Origin 或来源不在列表中时，函数会失败关闭。正式 GitHub Pages 的 origin 只包含协议和主机，例如 `https://gdz7274.github.io`，不包含仓库路径；需要本地验收时可逗号分隔追加 `http://127.0.0.1:4173`。
+10. 按 [`supabase/README.md`](../supabase/README.md) 验证权限、RPC、统一 `wall_notes` 投影和媒体边界。
 
-前台不启用 Supabase Anonymous Sign-Ins。浏览器使用公共 key 读取脱敏视图，并调用 `SECURITY DEFINER` 公共 RPC 写入；schema v3 已撤销 `anon` 和 `authenticated` 对业务底表的直接插入与读取权限。管理员登录使用 `authenticated` 角色，但管理 RPC 还会检查 UUID 白名单。
+前台不启用 Supabase Anonymous Sign-Ins。浏览器使用公共 key 读取脱敏视图，并调用 `SECURITY DEFINER` 公共 RPC 写入；schema v4 已撤销 `anon` 和 `authenticated` 对业务底表、照片表和待审媒体的直接访问。管理员登录使用 `authenticated` 角色，但管理 RPC 和媒体函数还会检查 UUID 白名单。
 
 数据库已提供基础频率限制和常见联系方式过滤，但公共 key 仍无法识别真实用户。会话 ID 可被伪造，共享网络也可能共用网络额度；这些措施不能替代验证码、WAF、可靠身份、撤回或个人数据权限。正式运营前必须补齐服务端风控与未成年人治理。不要在网页、GitHub 仓库或 Actions 变量中使用 `service_role` key。
 
@@ -79,9 +83,24 @@ git push -u origin main
 | `SUPABASE_URL` | 是 | Supabase Project URL |
 | `SUPABASE_ANON_KEY` | 是 | Supabase Publishable key 或旧版 anon public key |
 
-生产部署固定使用审核模式，不再提供跳过审核的开关。必须执行到 `0004_release_hardening.sql`；部署任务会调用公开的 `moderation_status` 探针，只有数据库返回 `schemaVersion: 3`、`hardeningVersion: 1` 和 `submissionsRequireReview: true` 才会继续发布。`0004` 是 schema v3 的发布加固迁移，不改变该契约版本号。
+生产部署固定使用审核模式，不再提供跳过审核的开关。必须执行到 `0006_photo_media_service_boundary.sql` 并部署媒体函数；Pages 部署任务只有在数据库返回 `schemaVersion: 4`、`hardeningVersion: 1`、`submissionsRequireReview: true`、`photoNotesEnabled: true`、`photoUploadMode: moderator_only` 和 `photoMediaServiceBoundaryVersion: 1` 时才继续。它还会验证 `wall_notes` 的照片列以及媒体函数对 Pages origin 的 CORS 预检。
 
 `SUPABASE_ANON_KEY` 虽然放在 GitHub Variables 中，但部署后仍会出现在浏览器可读取的 `config.js` 里。这是 Supabase 公共前端密钥的正常用法，不代表它可以绕过 RLS。
+
+### 可选：受保护的 Supabase 自动发布
+
+仓库中的 `Release Supabase schema and photo media function` 工作流支持手动预检/部署，也会在推送唯一 `supabase-v*` 标签时固定执行部署；两条路径都绑定 `supabase-production` Environment。建议为该 Environment 配置 required reviewers，避免普通 push 修改生产数据库。标签只是触发方式，不是授权边界：未获 Environment 审批的标签发布不能写入生产数据库。除上表两项外，还要配置：
+
+| 类型 | 名称 | 用途 |
+| --- | --- | --- |
+| Variable | `SUPABASE_PROJECT_REF` | 20 位项目 ref，不是完整 URL |
+| Variable | `PHOTO_NOTE_ALLOWED_ORIGINS` | 允许调用媒体函数的网页 origin，逗号分隔 |
+| Secret | `SUPABASE_ACCESS_TOKEN` | 仅供 Supabase CLI 发布，不进入前端 artifact |
+| Secret | `SUPABASE_DB_PASSWORD` | 仅供迁移连接，不进入前端 artifact |
+
+先以 `mode=preflight` 运行，检查 CLI 显示的远端迁移历史和 `db push --dry-run`。手动 `mode=deploy` 仍要求确认 `migration_history_confirmed`；而 `supabase-v*` 标签固定为 deploy，不读取这个复选项，但无论哪种路径，dry run 一旦显示会重放任一 `0001` 至 `0004` 迁移都会强制失败。早期通过 SQL Editor 手工执行的迁移通常不会自动进入 Supabase CLI 的迁移历史；应先备份数据库，并按 Supabase 官方 migration repair 流程核对、补齐历史，不能仅依赖勾选确认。
+
+推荐顺序是：在功能分支完成并提交迁移、Edge Function 与前端改动；先推送该功能分支，再从同一提交创建并推送一个未重复使用的 `supabase-v*` 标签。标签工作流先 dry run、拒绝旧迁移重放，再应用待执行迁移、设置函数 origin、部署 `photo-note-media`、验证 schema v4、公开照片投影和函数 CORS；成功并通过 Environment 审批后，才合并或推送 `main` 触发 Pages。preflight 不写远端数据；deploy 属于生产写入，必须经过 Environment 审批。不要把已用于生产的标签移动到其他提交。
 
 ## 4. 启用并发布 Pages
 
@@ -94,9 +113,9 @@ git push -u origin main
    https://<你的用户名>.github.io/intergenerational-question-wall/
    ```
 
-工作流会运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs` 中的后端契约、投稿恢复码安全测试，核对关键资源、本地化图标和 `0003` / `0004` 迁移文件，再验证远端 schema v3 与 hardening v1。随后复制 `prototype/` 到临时发布目录，并用仓库变量生成仅用于线上 artifact 的 `config.js`。仓库中的 `prototype/config.js` 会继续保留空配置，方便本地演示，也避免把项目地址硬编码进源码。缺少变量、URL 不是托管 Supabase HTTPS 地址或数据库迁移不兼容时，工作流会主动失败。该探针能确认远端已应用带 hardening marker 的 `0004`，但不能替代全部 RPC、权限和发布后业务验收；Pages 回滚不会回滚数据库。
+工作流会运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs`，核对关键资源、schema-v4 迁移与 Edge Function 媒体动作契约，再验证远端 schema v4、公开照片列和函数 CORS。随后复制 `prototype/` 到临时发布目录，并用仓库变量生成仅用于线上 artifact 的 `config.js`。仓库中的 `prototype/config.js` 会继续保留空配置，方便本地演示，也避免把项目地址硬编码进源码。缺少变量、URL 不是托管 Supabase HTTPS 地址、数据库迁移不兼容或函数尚未部署时，工作流会主动失败。Pages 回滚不会回滚数据库、Storage 或 Edge Function。
 
-当前公开页缓存版本为 `styles.css?v=20`、`app.js?v=21`、`backend.js?v=4`、`config.js?v=4`，后台为 `admin.css?v=5`、`admin.js?v=6`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 默认只允许同源脚本与样式，网络连接仅放行同源和 `https://*.supabase.co`。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
+当前公开页缓存版本为 `styles.css?v=22`、`app.js?v=23`、`backend.js?v=5`、`config.js?v=4`，后台为 `admin.css?v=6`、`admin.js?v=8`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 必须允许连接 Supabase API/Edge Function，并允许从受信 Supabase Storage 主机加载已发布照片；采集页的本地预览还需要 `blob:` 图片源。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
 
 以后每次向 `main` 推送都会自动更新网站。由于浏览器和 CDN 可能缓存静态资源，发布后应在手机上重新打开页面或执行一次强制刷新。
 
@@ -114,7 +133,10 @@ git push -u origin main
 8. 使用 `reviewer` 验证可以审核但不能修改运行状态；使用 `owner` 修改状态后确认日志记录了设置前后值。
 9. 使用未加入白名单的 Supabase 用户登录，确认无法读取或执行任何管理 RPC。
 10. 清除设备 A 的站点数据，确认“我的”和已看记录会重置；只有事先另存的恢复码可以重新导入投稿。
-11. 查看浏览器控制台和 Actions 日志，确认没有 RLS、跨域、契约测试或静态资源 404 错误。
+11. 使用管理员手机拍摄一张测试便签，确认浏览器完成压缩和隐私重编码、私有预览可见，但 `pending` 状态不会出现在公开墙或公开桶 URL 中。
+12. 批准测试照片，确认它以 `kind=photo` 进入单张滑动墙，图片、转写与无障碍描述正确；隐藏后确认已打开的墙面会自动移除，并检查公开对象清理结果。可在测试环境模拟一次删除失败，确认隐藏列表出现“重试清理公开图片”且重试成功后入口消失。
+13. 使用未加入白名单的登录账号和匿名窗口，确认不能创建上传地址、读取私有预览或直接写入两个媒体桶。
+14. 查看浏览器控制台和 Actions 日志，确认没有 RLS、跨域、契约测试、Edge Function 或静态资源 404 错误。
 
 ## 发布前检查
 

@@ -144,6 +144,8 @@
     loadMorePromise: null,
     settingsSavePromise: null,
     workspaceRequestId: 0,
+    sessionEpoch: 0,
+    sessionAbortController: typeof AbortController === "function" ? new AbortController() : null,
     searchTimer: null,
     toastTimer: null,
   };
@@ -206,12 +208,46 @@
     sessionStorage.setItem(sessionKey, JSON.stringify(session));
   }
 
+  function sessionRequestSignal() {
+    return state.sessionAbortController?.signal;
+  }
+
+  function assertSessionEpoch(epoch) {
+    if (epoch !== state.sessionEpoch || !state.session) {
+      const error = new Error("登录会话已结束。");
+      error.code = "session_ended";
+      throw error;
+    }
+  }
+
   function clearSession() {
+    state.sessionEpoch += 1;
+    state.sessionAbortController?.abort();
+    state.sessionAbortController = typeof AbortController === "function" ? new AbortController() : null;
     state.session = null;
     state.profile = null;
+    state.summary = {};
     state.runtimeSettings = null;
+    state.rows = [];
+    state.hasMore = false;
+    state.photoPreviewUrls.clear();
+    state.pendingPhotoEdit = null;
+    state.pendingAction = null;
+    state.pendingRuntimeSettings = null;
+    setPhotoCaptureBusy(false);
     state.workspaceRequestId += 1;
     state.workspaceRefreshQueued = false;
+    state.workspaceRefreshPromise = null;
+    state.loadMorePromise = null;
+    state.sessionRefreshPromise = null;
+    state.settingsSavePromise = null;
+    resetPhotoSelection({ resetForm: true });
+    elements.contentList.replaceChildren();
+    [elements.reasonDialog, elements.photoEditDialog, elements.emergencyDialog].forEach((modal) => {
+      if (modal?.open) modal.close();
+    });
+    elements.adminIdentity.textContent = "";
+    elements.adminRole.textContent = "";
     sessionStorage.removeItem(sessionKey);
   }
 
@@ -241,19 +277,23 @@
     if (!state.session) throw new Error("登录会话已失效，请重新登录。");
     if (!force && state.session.expiresAt > Date.now() + 60_000) return state.session;
     if (state.sessionRefreshPromise) return state.sessionRefreshPromise;
+    const sessionEpoch = state.sessionEpoch;
 
     state.sessionRefreshPromise = (async () => {
       const response = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=refresh_token`, {
         method: "POST",
         headers: apiHeaders(),
         body: JSON.stringify({ refresh_token: state.session.refreshToken }),
+        signal: sessionRequestSignal(),
       });
+      assertSessionEpoch(sessionEpoch);
       if (!response.ok) {
         clearSession();
         throw new Error("登录会话已失效，请重新登录。");
       }
 
       const payload = await response.json();
+      assertSessionEpoch(sessionEpoch);
       saveSession({
         accessToken: payload.access_token,
         refreshToken: payload.refresh_token,
@@ -270,12 +310,16 @@
   }
 
   async function rpc(name, body = {}, retry = true) {
+    const sessionEpoch = state.sessionEpoch;
     await refreshSession();
+    assertSessionEpoch(sessionEpoch);
     const response = await fetch(`${supabaseUrl}/rest/v1/rpc/${name}`, {
       method: "POST",
       headers: apiHeaders(state.session.accessToken),
       body: JSON.stringify(body),
+      signal: sessionRequestSignal(),
     });
+    assertSessionEpoch(sessionEpoch);
 
     if (response.status === 401 && retry) {
       await refreshSession(true);
@@ -296,12 +340,16 @@
   }
 
   async function photoMediaRequest(body, retry = true) {
+    const sessionEpoch = state.sessionEpoch;
     await refreshSession();
+    assertSessionEpoch(sessionEpoch);
     const response = await fetch(`${supabaseUrl}/functions/v1/photo-note-media`, {
       method: "POST",
       headers: apiHeaders(state.session.accessToken),
       body: JSON.stringify(body),
+      signal: sessionRequestSignal(),
     });
+    assertSessionEpoch(sessionEpoch);
 
     if (response.status === 401 && retry) {
       await refreshSession(true);
@@ -387,6 +435,7 @@
         method: "PUT",
         headers: { "Content-Type": blob.type || "image/jpeg" },
         body: blob,
+        signal: sessionRequestSignal(),
       });
       if (!response.ok) throw new Error(`照片上传失败（${response.status}），请重试。`);
     },
@@ -441,6 +490,13 @@
     async cleanupHiddenMedia(id) {
       return photoMediaRequest({ action: "removeHiddenPublicMedia", id });
     },
+    async hideReportedPhoto(reportId, reason = "") {
+      return photoMediaRequest({
+        action: "hideReportedPhoto",
+        reportId,
+        reason: reason || null,
+      });
+    },
   });
 
   async function requestMagicLink(email) {
@@ -458,14 +514,15 @@
   }
 
   async function signOut() {
-    if (state.session?.accessToken) {
-      await fetch(`${supabaseUrl}/auth/v1/logout`, {
-        method: "POST",
-        headers: apiHeaders(state.session.accessToken),
-      }).catch(() => null);
-    }
+    const accessToken = state.session?.accessToken || "";
     clearSession();
     showLogin();
+    if (accessToken) {
+      await fetch(`${supabaseUrl}/auth/v1/logout`, {
+        method: "POST",
+        headers: apiHeaders(accessToken),
+      }).catch(() => null);
+    }
   }
 
   function setLoginStatus(message, isError = false) {
@@ -730,6 +787,9 @@
         actionButton("下架", "hide", { ...options, className: "is-danger" }),
       );
     } else if (row.status === "hidden") {
+      if (row.publicObjectPath) {
+        container.append(actionButton("重试清理公开图片", "cleanup_media", { ...options, className: "is-danger" }));
+      }
       container.append(actionButton("重新发布", "publish", { ...options, className: "is-approve" }));
     }
   }
@@ -748,7 +808,9 @@
     if (cached?.url && cached.expiresAt > Date.now() + 15_000) return cached.url;
     if (cached?.promise) return cached.promise;
 
+    const sessionEpoch = state.sessionEpoch;
     const promise = photoNoteBackend.preview(row.id).then((preview) => {
+      assertSessionEpoch(sessionEpoch);
       if (!preview?.url) throw new Error("没有可用的照片预览。");
       const entry = {
         url: preview.url,
@@ -757,7 +819,9 @@
       state.photoPreviewUrls.set(row.id, entry);
       return entry.url;
     }).catch((error) => {
-      state.photoPreviewUrls.delete(row.id);
+      if (state.photoPreviewUrls.get(row.id)?.promise === promise) {
+        state.photoPreviewUrls.delete(row.id);
+      }
       throw error;
     });
     state.photoPreviewUrls.set(row.id, { promise });
@@ -1242,17 +1306,21 @@
       } else if (action.entityType === "answer") {
         await rpc("admin_moderate_answer", { p_id: action.entityId, p_action: action.action, p_reason: reason || null });
       } else if (action.entityType === "photo_note") {
-        await photoNoteBackend.moderate(action.entityId, action.action, reason);
+        if (action.action === "cleanup_media") {
+          await photoNoteBackend.cleanupHiddenMedia(action.entityId);
+        } else {
+          await photoNoteBackend.moderate(action.entityId, action.action, reason);
+        }
       } else {
-        const result = await rpc("admin_resolve_report", { p_id: action.entityId, p_action: action.action, p_note: reason || null });
-        if (action.action === "hide_and_resolve" && action.photoNoteId && result?.noteKind === "photo") {
-          try {
-            await photoNoteBackend.cleanupHiddenMedia(action.photoNoteId);
-          } catch {
+        if (action.action === "hide_and_resolve" && action.photoNoteId) {
+          const result = await photoNoteBackend.hideReportedPhoto(action.entityId, reason);
+          if (result?.mediaRemoved === false) {
             showToast("内容已下架，但公开图片清理未确认，请在照片审核中复核。", true);
             await refreshWorkspace();
             return;
           }
+        } else {
+          await rpc("admin_resolve_report", { p_id: action.entityId, p_action: action.action, p_note: reason || null });
         }
       }
       showToast("处理已保存并写入操作记录。");
@@ -1510,6 +1578,7 @@
       setPhotoCaptureStatus("问题、回答和图片描述都需要填写。", true);
       return;
     }
+    const sessionEpoch = state.sessionEpoch;
 
     setPhotoCaptureBusy(true, "正在处理照片…");
     setPhotoCaptureStatus("正在压缩照片并清除拍摄信息，请不要关闭页面。");
@@ -1517,7 +1586,9 @@
       let draft = state.photoDraft;
       if (!draft) {
         const encoded = await encodeSelectedPhoto();
+        assertSessionEpoch(sessionEpoch);
         const created = await photoNoteBackend.createDraft(metadata);
+        assertSessionEpoch(sessionEpoch);
         if (!created.note?.id || !created.upload) throw new Error("待审记录创建失败，请重试。");
         draft = {
           id: created.note.id,
@@ -1534,10 +1605,12 @@
         setPhotoCaptureBusy(true, "正在安全上传…");
         setPhotoCaptureStatus(`正在上传处理后的照片（${formatFileSize(draft.blob.size)}）…`);
         if (!draft.upload?.signedUrl) draft.upload = await photoNoteBackend.refreshUpload(draft.id);
+        assertSessionEpoch(sessionEpoch);
         try {
           await photoNoteBackend.upload(draft.upload, draft.blob);
+          assertSessionEpoch(sessionEpoch);
         } catch (uploadError) {
-          draft.upload = null;
+          if (sessionEpoch === state.sessionEpoch) draft.upload = null;
           throw uploadError;
         }
         draft.uploaded = true;
@@ -1553,8 +1626,10 @@
           { width: draft.width, height: draft.height },
           metadata,
         );
+        assertSessionEpoch(sessionEpoch);
       } catch (completeError) {
         const actual = await photoNoteBackend.get(draft.id).catch(() => null);
+        assertSessionEpoch(sessionEpoch);
         if (actual?.status !== "pending") throw completeError;
         note = actual;
       }
@@ -1567,10 +1642,11 @@
       elements.photoStatus.value = "pending";
       selectView("photo_notes");
     } catch (error) {
+      if (sessionEpoch !== state.sessionEpoch) return;
       const uploadedHint = state.photoDraft?.uploaded ? "照片已安全上传；再次点提交会继续入审，不会重复上传。" : "照片和已填写文字仍保留在本页。";
       setPhotoCaptureStatus(`${error.message || "提交失败，请重试。"} ${uploadedHint}`, true);
     } finally {
-      setPhotoCaptureBusy(false);
+      if (sessionEpoch === state.sessionEpoch) setPhotoCaptureBusy(false);
     }
   }
 

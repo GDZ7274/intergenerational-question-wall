@@ -744,6 +744,12 @@ begin
       end if;
       next_status := 'hidden';
       next_featured := false;
+    when 'clear_media' then
+      if current_note.status <> 'hidden' then
+        raise exception 'only hidden photo notes can clear public media'
+          using errcode = '23514';
+      end if;
+      next_public_path := null;
     when 'publish' then
       if current_note.status <> 'hidden' then
         raise exception 'only hidden photo notes can be republished'
@@ -800,7 +806,10 @@ begin
       published_at = next_published_at,
       moderated_at = now(),
       moderated_by = auth.uid(),
-      moderation_reason = clean_reason,
+      moderation_reason = case
+        when clean_action = 'clear_media' then current_note.moderation_reason
+        else clean_reason
+      end,
       updated_at = now()
   where id = p_id;
 

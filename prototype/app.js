@@ -1,9 +1,11 @@
 const STORAGE_KEY = "question-wall-prototype-v1";
 const SESSION_KEY = "question-wall-prototype-session";
 const SEEN_NOTES_COOKIE_KEY = "question-wall-prototype-seen-v1";
+const RECENT_VIEWED_STORAGE_KEY = "question-wall-recent-viewed-v1";
 const HISTORY_STATE_KEY = "questionWallNavigation";
 const SEEN_NOTES_COOKIE_MAX_AGE = 60 * 60 * 24 * 180;
 const SEEN_NOTES_COOKIE_LIMIT = 100;
+const RECENT_VIEWED_LIMIT = 60;
 const SWIPE_HINT_SESSION_KEY = "question-wall-swipe-hint-seen";
 const LANDING_OPENING_SESSION_KEY = "question-wall-opening-seen-v1";
 const LANDING_OPENING_DELAY_MS = 2_000;
@@ -14,6 +16,14 @@ const FAVORITE_LIMIT = 120;
 const PUBLIC_NOTE_VERIFICATION_TTL_MS = RUNTIME_POLL_INTERVAL_MS;
 const NOTE_SHARE_IMAGE_CACHE_LIMIT = 4;
 const PUBLIC_NOTE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const PHOTO_NOTE_MAX_DOWNLOAD_BYTES = 12 * 1024 * 1024;
+const PHOTO_NOTE_MIME_EXTENSIONS = Object.freeze({
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+});
+const BRAND_NAME = "解鸭留言墙";
+const BRAND_FULL_TITLE = "【躺倒鸭】解鸭留言墙";
 const noteTemplateImageCache = new Map();
 const noteShareImageCache = new Map();
 const noteSharePreparationPromises = new Map();
@@ -227,6 +237,7 @@ const persisted = loadPersistedState();
 syncFavoriteNoteSnapshots({ save: false });
 savePersistedState();
 const seenNoteIds = loadSeenNoteIds();
+const recentViewedNoteIds = loadRecentViewedNoteIds();
 const pendingReceiptFallback = loadPendingReceiptFallback();
 
 const ui = {
@@ -234,6 +245,7 @@ const ui = {
   selectedQuestionId: null,
   mineTab: "questions",
   pendingIntent: null,
+  openParticipationAfterRender: false,
   recommendationIds: [],
   recommendationIndex: -1,
   recommendationComplete: false,
@@ -252,6 +264,10 @@ if (pendingReceiptFallback?.submission) {
 const app = document.getElementById("app");
 const dialog = document.getElementById("note-dialog");
 const dialogContent = document.getElementById("note-dialog-content");
+const participationDialog = document.getElementById("participation-dialog");
+const participationDialogContent = document.getElementById("participation-dialog-content");
+const shareDialog = document.getElementById("share-dialog");
+const shareDialogContent = document.getElementById("share-dialog-content");
 const toast = document.getElementById("toast");
 let toastTimer = null;
 let suppressClickUntil = 0;
@@ -273,11 +289,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.addEventListener("keydown", handleKeydown);
   dialog.addEventListener("click", handleDialogClick);
   dialog.addEventListener("cancel", handleDialogCancel);
+  participationDialog?.addEventListener("click", handleParticipationDialogClick);
+  participationDialog?.addEventListener("cancel", handleParticipationDialogCancel);
+  shareDialog?.addEventListener("click", handleShareDialogClick);
+  shareDialog?.addEventListener("cancel", handleShareDialogCancel);
   window.addEventListener("beforeunload", handleBeforeUnload);
   prepareInitialRoute();
+  if (!backend.enabled) restoreRecentViewedHistory();
   const initialOverlayNoteId = initializeNavigationHistory(getSharedNoteIdFromUrl());
   window.addEventListener("popstate", handlePopState);
   render();
+  if (ui.openParticipationAfterRender) {
+    ui.openParticipationAfterRender = false;
+    openParticipationSheet();
+  }
   scheduleLandingOpening();
   if (initialOverlayNoteId && !backend.enabled) openNote(initialOverlayNoteId, { fromHistory: true });
 
@@ -313,26 +338,53 @@ async function refreshRemoteSnapshot({ resetRecommendations = false } = {}) {
   await reconcileRemoteFavorites();
 
   if (resetRecommendations) {
-    ui.recommendationIds = [];
-    ui.recommendationIndex = -1;
+    restoreRecentViewedHistory();
   }
   ui.recommendationComplete = false;
 }
 
 async function refreshRemoteContent({ resetRecommendations = false } = {}) {
+  const previousSignature = remoteContentSignature(remoteNotes, remoteQuestions);
+  const previousNoteIds = new Set(remoteNotes.map((note) => note.id));
+  const recommendationWasComplete = ui.recommendationComplete;
   const content = await backend.loadContent();
+  const nextSignature = remoteContentSignature(content.notes, content.questions);
+  const contentChanged = previousSignature !== nextSignature;
   remoteNotes = content.notes;
   remoteQuestions = content.questions;
   remoteAvailable = true;
   remoteLoadFailed = false;
+  const nextNoteIds = new Set(remoteNotes.map((note) => note.id));
+  const removedNoteIds = [...previousNoteIds].filter((id) => !nextNoteIds.has(id));
+  purgeUnavailablePublicNotes(removedNoteIds);
   replacePublicNoteVerification(remoteNotes);
   await reconcileRemoteFavorites();
 
   if (resetRecommendations) {
-    ui.recommendationIds = [];
-    ui.recommendationIndex = -1;
+    restoreRecentViewedHistory();
+  } else {
+    reconcileRecommendationHistory();
+    if (!contentChanged) {
+      ui.recommendationComplete = recommendationWasComplete;
+    } else if (recommendationWasComplete) {
+      loadSeenNoteIds().forEach((id) => seenNoteIds.add(id));
+      const newlyAvailableNote = getRecommendedNotes().find(
+        (note) =>
+          !previousNoteIds.has(note.id) &&
+          !seenNoteIds.has(note.id) &&
+          !ui.recommendationIds.includes(note.id),
+      );
+      if (newlyAvailableNote) {
+        ui.recommendationIds.push(newlyAvailableNote.id);
+        ui.recommendationIndex = ui.recommendationIds.length - 1;
+        rememberSeenNote(newlyAvailableNote.id);
+        ui.recommendationComplete = false;
+      } else {
+        ui.recommendationComplete = true;
+      }
+    }
   }
-  ui.recommendationComplete = false;
+  return contentChanged;
 }
 
 async function ensureSharedNoteAvailable(noteId) {
@@ -416,10 +468,84 @@ function runtimeStatusChanged(previous, next) {
     .some((key) => previous[key] !== next[key]);
 }
 
+function remoteContentSignature(notes, questions) {
+  return JSON.stringify([
+    (Array.isArray(notes) ? notes : []).map((note) => [
+      note.id,
+      note.kind === "photo" ? "photo" : "text",
+      note.questionId || null,
+      note.answerId || null,
+      note.photoNoteId || null,
+      note.direction,
+      note.question,
+      note.answer,
+      note.createdAt,
+      Boolean(note.featured),
+      Number(note.answerCount || 0),
+      note.kind === "photo" ? normalizePhotoMediaUrl(note.mediaUrl || note.imageUrl) : "",
+      note.kind === "photo" ? note.altText || "" : "",
+      note.kind === "photo" ? normalizeMediaDimension(note.mediaWidth) : null,
+      note.kind === "photo" ? normalizeMediaDimension(note.mediaHeight) : null,
+    ]),
+    (Array.isArray(questions) ? questions : []).map((question) => [
+      question.id,
+      question.direction,
+      question.askerRole,
+      question.targetRole,
+      question.body,
+      Number(question.answerCount || 0),
+      question.createdAt,
+      question.status,
+    ]),
+  ]);
+}
+
 function resetRemoteRecommendations() {
   ui.recommendationIds = [];
   ui.recommendationIndex = -1;
   ui.recommendationComplete = false;
+}
+
+function purgeUnavailablePublicNotes(noteIds) {
+  const removedIds = new Set(
+    (Array.isArray(noteIds) ? noteIds : [])
+      .map(normalizePublicNoteId)
+      .filter(Boolean),
+  );
+  if (!removedIds.size) return false;
+
+  remoteNotes = remoteNotes.filter((note) => !removedIds.has(note.id));
+  removedIds.forEach((id) => {
+    verifiedPublicNotes.delete(id);
+    verifiedPublicNoteTimestamps.delete(id);
+    noteShareImageCache.delete(id);
+    noteSharePreparationPromises.delete(id);
+  });
+  reconcileRecommendationHistory();
+  ui.recommendationComplete = false;
+
+  const openDialogNoteId = normalizePublicNoteId(dialog?.dataset?.noteId);
+  const overlayNoteId = normalizePublicNoteId(getNavigationSnapshot()?.overlayNoteId);
+  if (removedIds.has(openDialogNoteId) || removedIds.has(overlayNoteId)) {
+    if (dialog?.open) dialog.close();
+    if (dialog?.dataset) delete dialog.dataset.noteId;
+    if (dialogContent) dialogContent.innerHTML = "";
+    if (overlayNoteId && navigationDepth > 0) {
+      window.history.back();
+    } else if (overlayNoteId) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("note");
+      window.history.replaceState(
+        createNavigationState(),
+        "",
+        `${url.pathname}${url.search}#${ui.route}`,
+      );
+    }
+  }
+
+  const sharedNoteId = normalizePublicNoteId(shareDialog?.dataset?.noteId);
+  if (removedIds.has(sharedNoteId)) closeShareSheet();
+  return true;
 }
 
 function handleRemoteUnavailable(error) {
@@ -476,27 +602,49 @@ async function syncRuntimeStatus() {
   runtimeSyncPromise = (async () => {
     try {
       const previous = runtimeStatus;
+      const contentWasAvailable = remoteAvailable;
       const next = await backend.loadRuntimeStatus();
       const changed = runtimeStatusChanged(previous, next);
-      const needsContentRefresh = changed || !remoteAvailable;
+      let shouldRender = changed || !contentWasAvailable;
       runtimeStatus = next;
 
       if (next.emergencyLockdown) {
-        remoteNotes = [];
-        remoteQuestions = [];
-        remoteAvailable = true;
-        remoteLoadFailed = false;
-        validatedFavoriteNoteIds = new Set();
-        clearPublicNoteVerification();
-        resetRemoteRecommendations();
-      } else if (needsContentRefresh) {
-        await refreshRemoteContent({ resetRecommendations: previous.emergencyLockdown });
+        const enteringLockdown = !previous.emergencyLockdown || !contentWasAvailable;
+        if (enteringLockdown) {
+          const removedNoteIds = remoteNotes.map((note) => note.id);
+          remoteNotes = [];
+          remoteQuestions = [];
+          remoteAvailable = true;
+          remoteLoadFailed = false;
+          validatedFavoriteNoteIds = new Set();
+          purgeUnavailablePublicNotes(removedNoteIds);
+          clearPublicNoteVerification();
+          resetRemoteRecommendations();
+          shouldRender = true;
+        }
+      } else {
+        try {
+          const contentChanged = await refreshRemoteContent({
+            resetRecommendations: previous.emergencyLockdown || !contentWasAvailable,
+          });
+          shouldRender = shouldRender || contentChanged || previous.emergencyLockdown;
+        } catch (contentError) {
+          if (!contentWasAvailable || previous.emergencyLockdown) {
+            if (previous.emergencyLockdown) remoteAvailable = false;
+            throw contentError;
+          }
+          console.warn("Unable to refresh public content; keeping the last verified snapshot.", contentError);
+        }
       }
 
-      if (needsContentRefresh) render();
+      if (shouldRender) render();
     } catch (error) {
-      handleRemoteUnavailable(error);
-      render();
+      if (!remoteAvailable) {
+        handleRemoteUnavailable(error);
+        render();
+      } else {
+        console.warn("Unable to refresh the question-wall runtime state.", error);
+      }
     }
   })().finally(() => {
     runtimeSyncPromise = null;
@@ -656,21 +804,75 @@ function createFavoriteNoteSnapshot(note) {
   const id = normalizePublicNoteId(note.id);
   const questionId = normalizePublicNoteId(note.questionId);
   const answerId = normalizePublicNoteId(note.answerId);
+  const photoNoteId = normalizePublicNoteId(note.photoNoteId);
+  const kind = note.kind === "photo" ? "photo" : "text";
   const direction = ["adult_to_child", "child_to_adult"].includes(note.direction) ? note.direction : "";
-  const question = truncateNoteText(note.question, 80);
-  const answer = truncateNoteText(note.answer, 160);
-  if (!id || !questionId || !answerId || !direction || !question || !answer) return null;
+  const question = truncateNoteText(note.question, kind === "photo" ? 160 : 80);
+  const answer = truncateNoteText(note.answer, kind === "photo" ? 320 : 160);
+  const mediaUrl = kind === "photo" ? normalizePhotoMediaUrl(note.mediaUrl || note.imageUrl) : "";
+  if (
+    !id || !direction || !question || !answer ||
+    (kind === "text" && (!questionId || !answerId)) ||
+    (kind === "photo" && (!photoNoteId || !mediaUrl))
+  ) return null;
   return {
     id,
-    questionId,
-    answerId,
+    kind,
+    questionId: questionId || null,
+    answerId: answerId || null,
+    photoNoteId: photoNoteId || null,
     direction,
     question,
     answer,
     createdAt: typeof note.createdAt === "string" ? note.createdAt : new Date().toISOString(),
     featured: Boolean(note.featured),
     answerCount: Math.max(1, Math.min(9999, Number(note.answerCount) || 1)),
+    mediaUrl: mediaUrl || null,
+    imageUrl: mediaUrl || null,
+    altText: kind === "photo" ? truncateNoteText(note.altText, 300) : "",
+    mediaWidth: kind === "photo" ? normalizeMediaDimension(note.mediaWidth) : null,
+    mediaHeight: kind === "photo" ? normalizeMediaDimension(note.mediaHeight) : null,
   };
+}
+
+function normalizePhotoMediaUrl(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    const publicPrefix = "/storage/v1/object/public/photo-note-public/";
+    const trustedHost = url.protocol === "https:" && url.hostname.endsWith(".supabase.co");
+    const trustedPath = url.pathname.startsWith(publicPrefix);
+    if (!trustedHost || !trustedPath || url.username || url.password) return "";
+    const objectPath = url.pathname.slice(publicPrefix.length);
+    const pathSegments = objectPath.split("/");
+    if (
+      !objectPath ||
+      pathSegments.some((segment) => {
+        if (!segment || segment === "." || segment === "..") return true;
+        try {
+          const decoded = decodeURIComponent(segment);
+          return !decoded || decoded === "." || decoded === ".." || /[\\/\u0000-\u001f]/.test(decoded);
+        } catch {
+          return true;
+        }
+      })
+    ) return "";
+
+    const configuredUrl = String(globalThis.QUESTION_WALL_CONFIG?.supabaseUrl || "").trim();
+    if (configuredUrl) {
+      const configuredOrigin = new URL(configuredUrl).origin;
+      if (url.origin !== configuredOrigin) return "";
+    }
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function normalizeMediaDimension(value) {
+  const dimension = Number(value);
+  return Number.isSafeInteger(dimension) && dimension > 0 && dimension <= 20_000 ? dimension : null;
 }
 
 function truncateNoteText(value, limit) {
@@ -919,6 +1121,83 @@ function loadSeenNoteIds() {
   }
 }
 
+function loadRecentViewedNoteIds() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RECENT_VIEWED_STORAGE_KEY));
+    if (!Array.isArray(parsed)) return [];
+    const ordered = [];
+    parsed.forEach((value) => {
+      const id = normalizePublicNoteId(value);
+      if (!id) return;
+      const previousIndex = ordered.indexOf(id);
+      if (previousIndex >= 0) ordered.splice(previousIndex, 1);
+      ordered.push(id);
+    });
+    return ordered.slice(-RECENT_VIEWED_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentViewedNoteIds() {
+  try {
+    localStorage.setItem(
+      RECENT_VIEWED_STORAGE_KEY,
+      JSON.stringify(recentViewedNoteIds.slice(-RECENT_VIEWED_LIMIT)),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function rememberRecentViewedNote(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  if (!id) return;
+  const previousIndex = recentViewedNoteIds.indexOf(id);
+  if (previousIndex >= 0) recentViewedNoteIds.splice(previousIndex, 1);
+  recentViewedNoteIds.push(id);
+  if (recentViewedNoteIds.length > RECENT_VIEWED_LIMIT) {
+    recentViewedNoteIds.splice(0, recentViewedNoteIds.length - RECENT_VIEWED_LIMIT);
+  }
+  saveRecentViewedNoteIds();
+}
+
+function restoreRecentViewedHistory() {
+  const availableIds = new Set(getAvailableNotes().map((note) => note.id));
+  const validIds = recentViewedNoteIds.filter((id) => availableIds.has(id));
+  const changed = validIds.length !== recentViewedNoteIds.length ||
+    validIds.some((id, index) => recentViewedNoteIds[index] !== id);
+  recentViewedNoteIds.splice(0, recentViewedNoteIds.length, ...validIds);
+  if (changed) saveRecentViewedNoteIds();
+  ui.recommendationIds = [...validIds];
+  ui.recommendationIndex = -1;
+  ui.recommendationComplete = false;
+  return validIds;
+}
+
+function reconcileRecommendationHistory() {
+  const availableIds = new Set(getAvailableNotes().map((note) => note.id));
+  const recentValidIds = recentViewedNoteIds.filter((id) => availableIds.has(id));
+  if (recentValidIds.length !== recentViewedNoteIds.length) {
+    recentViewedNoteIds.splice(0, recentViewedNoteIds.length, ...recentValidIds);
+    saveRecentViewedNoteIds();
+  }
+
+  const previousCurrentId = ui.recommendationIds[ui.recommendationIndex] || "";
+  const validIds = ui.recommendationIds.filter((id, index, all) =>
+    availableIds.has(id) && all.indexOf(id) === index,
+  );
+  if (validIds.length === ui.recommendationIds.length) return validIds;
+
+  ui.recommendationIds = validIds;
+  ui.recommendationIndex = previousCurrentId ? validIds.indexOf(previousCurrentId) : -1;
+  if (ui.recommendationIndex < 0 && !ui.recommendationComplete) {
+    ui.recommendationIndex = -1;
+  }
+  return validIds;
+}
+
 function rememberSeenNote(noteId) {
   if (!noteId) return;
 
@@ -934,6 +1213,7 @@ function rememberSeenNote(noteId) {
   } catch {
     // The in-memory set still prevents repeats for this visit when cookies are unavailable.
   }
+  rememberRecentViewedNote(noteId);
 }
 
 function shouldShowSwipeHint() {
@@ -1008,6 +1288,11 @@ function getSharedNoteIdFromUrl() {
 }
 
 function prepareInitialRoute() {
+  if (ui.route === "participate") {
+    ui.route = "wall";
+    ui.openParticipationAfterRender = true;
+    return;
+  }
   if (persisted.role) return;
 
   if (ui.route === "ask") {
@@ -1015,9 +1300,6 @@ function prepareInitialRoute() {
     ui.route = "identity";
   } else if (ui.route === "pool" || ui.route === "answer") {
     ui.pendingIntent = { type: "answer", questionId: ui.selectedQuestionId || null };
-    ui.route = "identity";
-  } else if (ui.route === "participate") {
-    ui.pendingIntent = { type: "navigate", route: "participate" };
     ui.route = "identity";
   }
 }
@@ -1056,6 +1338,15 @@ function initializeNavigationHistory(initialOverlayNoteId = "") {
 function navigate(route, options = {}) {
   const { replace = false, preserveIntent = false, ...stateUpdates } = options;
   const nextRoute = normalizeRoute(route);
+  if (nextRoute === "participate") {
+    if (ui.route === "identity") {
+      ui.route = "wall";
+      window.history.replaceState(createNavigationState(), "", "#wall");
+      render();
+    }
+    openParticipationSheet();
+    return;
+  }
   if (nextRoute !== "home" && ui.landingOpeningActive) completeLandingOpening();
   if (ui.route === "identity" && nextRoute !== "identity" && !preserveIntent) {
     ui.pendingIntent = null;
@@ -1136,7 +1427,10 @@ function syncPageState({ isLanding, isFeed, isOpening }) {
 function prewarmCurrentFeedNote() {
   if (ui.route !== "wall" || ui.recommendationComplete) return;
   const id = ui.recommendationIds[ui.recommendationIndex];
-  if (id) void prepareNoteForShare(id);
+  const note = id ? findViewableNote(id) : null;
+  // A photographed note is already being loaded for the card. Fetch its full Blob only when
+  // the visitor opens the share sheet, avoiding a second large transfer on every swipe.
+  if (note && note.kind !== "photo") void prepareNoteForShare(id);
 }
 
 function renderReceiptFallbackPage() {
@@ -1321,14 +1615,14 @@ function renderTopbar() {
             <span class="brand-paper brand-paper-child"></span>
           </span>
           <span class="brand-copy">
-            <span class="brand-name">问问墙</span>
-            <span class="brand-tagline">大人和小朋友的双向问答</span>
+            <span class="brand-name">${BRAND_NAME}</span>
+            <span class="brand-tagline">大朋友和小朋友的双向问答</span>
           </span>
         </button>
 
         <nav class="desktop-nav" aria-label="主要导航">
-          ${desktopNavButton("wall", "问答墙")}
-          ${desktopNavButton("participate", "参与")}
+          ${desktopNavButton("wall", "留言墙")}
+          <button class="nav-button" type="button" data-action="open-participation">问答</button>
           ${desktopNavButton("mine", "我的")}
         </nav>
 
@@ -1356,7 +1650,7 @@ function renderMobileNav() {
   return `
     <nav class="mobile-nav" aria-label="移动端主要导航">
       ${mobileNavButton("wall", "layout-grid", "墙")}
-      ${mobileNavButton("participate", "pen-line", "参与")}
+      ${mobileActionButton("participate", "pen-line", "问答", "open-participation")}
       ${mobileNavButton("mine", "user-round", "我的")}
     </nav>
   `;
@@ -1372,12 +1666,18 @@ function mobileNavButton(route, iconName, label) {
   `;
 }
 
+function mobileActionButton(className, iconName, label, action) {
+  return `
+    <button class="mobile-nav-button mobile-nav-${className}" type="button" data-action="${action}">
+      <span class="mobile-nav-icon">${icon(iconName)}</span>
+      <span>${label}</span>
+    </button>
+  `;
+}
+
 function navRouteIsCurrent(route) {
   if (route === "wall") {
     return ui.route === "wall";
-  }
-  if (route === "participate") {
-    return ["identity", "participate", "ask", "pool", "answer"].includes(ui.route);
   }
   return ui.route === route;
 }
@@ -1489,10 +1789,13 @@ function getRecommendedNotes() {
 
 function peekNextRecommendation() {
   loadSeenNoteIds().forEach((id) => seenNoteIds.add(id));
-  return getRecommendedNotes().find((note) => !seenNoteIds.has(note.id)) || null;
+  return getRecommendedNotes().find(
+    (note) => !seenNoteIds.has(note.id) && !ui.recommendationIds.includes(note.id),
+  ) || null;
 }
 
 function getCurrentRecommendation() {
+  reconcileRecommendationHistory();
   const currentId = ui.recommendationIds[ui.recommendationIndex];
   const current = getAvailableNotes().find((note) => note.id === currentId);
   if (current) return current;
@@ -1509,6 +1812,9 @@ function getCurrentRecommendation() {
 }
 
 function renderNoteCard(note, context = "feed") {
+  if (note.kind === "photo" && note.mediaUrl) {
+    return renderPhotoNoteCard(note, context);
+  }
   const direction = directionMeta(note.direction);
   const answerCount = note.answerCount || getAvailableNotes().filter((item) => item.questionId === note.questionId).length;
   const noteContext = context === "favorite" ? ' data-note-context="favorite"' : "";
@@ -1525,12 +1831,33 @@ function renderNoteCard(note, context = "feed") {
         <span class="direction-label ${direction.className}">${direction.label}</span>
       </span>
       <span class="note-question">${escapeHtml(note.question)}</span>
-      <span class="note-answer-label">${note.direction === "adult_to_child" ? "小朋友说" : "大人说"}</span>
+      <span class="note-answer-label">${note.direction === "adult_to_child" ? "小朋友说" : "大朋友说"}</span>
       <span class="note-answer">${escapeHtml(note.answer)}</span>
       <span class="note-footer">
         <span>${answerCount > 1 ? `${answerCount} 个回答` : formatDate(note.createdAt)}</span>
         <span class="note-open-hint">展开 ${icon("arrow-up-right")}</span>
       </span>
+    </button>
+  `;
+}
+
+function renderPhotoNoteCard(note, context = "feed") {
+  const noteContext = context === "favorite" ? ' data-note-context="favorite"' : "";
+  const width = normalizeMediaDimension(note.mediaWidth) || 4;
+  const height = normalizeMediaDimension(note.mediaHeight) || 3;
+  const altText = note.altText || `实体便签。问题：${note.question}。回答：${note.answer}`;
+  return `
+    <button
+      class="note-sheet note-template photo-note-card"
+      style="--template-ratio: ${width} / ${height}"
+      type="button"
+      data-action="open-note"
+      data-note-id="${escapeHtml(note.id)}"
+      ${noteContext}
+      aria-label="查看实体便签：${escapeHtml(note.question)}"
+    >
+      <img src="${escapeHtml(note.mediaUrl)}" alt="${escapeHtml(altText)}" loading="eager" decoding="async" fetchpriority="high" referrerpolicy="no-referrer" />
+      <span class="photo-note-badge">实体便签</span>
     </button>
   `;
 }
@@ -1566,7 +1893,7 @@ function renderNoteQuickActions(note, context = "feed") {
 }
 
 function renderRecommendationEnd() {
-  const canGoBack = ui.recommendationIds.length > 0;
+  const canGoBack = reconcileRecommendationHistory().length > 0;
   const completedBatch = canGoBack || getAvailableNotes().length > 0;
   const endContent = completedBatch
     ? `
@@ -1574,7 +1901,7 @@ function renderRecommendationEnd() {
           <img class="recommendation-end-gif" src="assets/ending-duck.gif" alt="" aria-hidden="true" />
           <div class="recommendation-end-dialog">
             <h1>哎鸭，被你看完啦</h1>
-            <p>下滑回看刚刚的便签</p>
+            ${canGoBack ? "<p>下滑回看刚刚的便签</p>" : "<p>新便签通过审核后会继续出现在这里</p>"}
           </div>
         </div>
       `
@@ -1625,8 +1952,8 @@ function renderIdentityPage() {
       </div>
 
       <div class="role-grid">
-        ${roleChoice("adult", "user-round", "我是大人", "向小朋友提问 · 回答小朋友的问题")}
-        ${roleChoice("child", "user-round", "我是小朋友", "向大人提问 · 回答大人的问题")}
+        ${roleChoice("adult", "user-round", "我是大朋友", "向小朋友提问 · 回答小朋友的问题")}
+        ${roleChoice("child", "user-round", "我是小朋友", "向大朋友提问 · 回答大朋友的问题")}
       </div>
     </div>
   `;
@@ -1645,10 +1972,82 @@ function roleChoice(role, iconName, title, description) {
   `;
 }
 
+function openParticipationSheet() {
+  if (!participationDialog || !participationDialogContent) {
+    if (!persisted.role) requestIdentity({ type: "navigate", route: "wall" });
+    return;
+  }
+  participationDialogContent.innerHTML = renderParticipationSheet();
+  refreshIcons();
+  if (!participationDialog.open) participationDialog.showModal();
+}
+
+function renderParticipationSheet() {
+  const roleCopy = persisted.role
+    ? `当前以${roleName(persisted.role)}身份参与`
+    : "先选想做的事，真正参与时再补选身份";
+  return `
+    <div class="action-sheet-handle" aria-hidden="true"></div>
+    <div class="action-sheet-head">
+      <div>
+        <p class="action-sheet-kicker">问答</p>
+        <h2 id="participation-dialog-title">这次想做什么？</h2>
+        <p>${escapeHtml(roleCopy)}</p>
+      </div>
+      <button class="action-sheet-close" type="button" data-participation-action="close" aria-label="关闭问答菜单">
+        ${icon("x")}
+      </button>
+    </div>
+    <div class="action-sheet-options">
+      <button class="action-sheet-option action-sheet-option-ask" type="button" data-participation-action="ask"${submissionsAreDisabled() ? " disabled" : ""}>
+        <span class="action-sheet-option-icon">${icon("message-circle-question")}</span>
+        <span><strong>提个问题</strong><small>把真正想知道的事写在便签上</small></span>
+        ${icon("chevron-right")}
+      </button>
+      <button class="action-sheet-option action-sheet-option-answer" type="button" data-participation-action="answer"${submissionsAreDisabled() ? " disabled" : ""}>
+        <span class="action-sheet-option-icon">${icon("pen-line")}</span>
+        <span><strong>去回答</strong><small>看看另一代正在问什么</small></span>
+        ${icon("chevron-right")}
+      </button>
+    </div>
+  `;
+}
+
+function closeParticipationSheet() {
+  if (participationDialog?.open) participationDialog.close();
+}
+
+function handleParticipationDialogCancel(event) {
+  event.preventDefault();
+  closeParticipationSheet();
+}
+
+function handleParticipationDialogClick(event) {
+  const actionTarget = event.target.closest("[data-participation-action]");
+  if (!actionTarget) {
+    const rect = participationDialog.getBoundingClientRect();
+    const outside =
+      event.clientX < rect.left || event.clientX > rect.right ||
+      event.clientY < rect.top || event.clientY > rect.bottom;
+    if (outside) closeParticipationSheet();
+    return;
+  }
+  const action = actionTarget.dataset.participationAction;
+  if (action === "close") {
+    closeParticipationSheet();
+  } else if (action === "ask") {
+    closeParticipationSheet();
+    startAsk();
+  } else if (action === "answer") {
+    closeParticipationSheet();
+    startAnswer();
+  }
+}
+
 function renderParticipatePage() {
   const role = persisted.role;
-  const askTarget = role === "adult" ? "小朋友" : "大人";
-  const answerFrom = role === "adult" ? "小朋友" : "大人";
+  const askTarget = role === "adult" ? "小朋友" : "大朋友";
+  const answerFrom = role === "adult" ? "小朋友" : "大朋友";
   return `
     <div class="page-inner">
       <div class="page-heading-row">
@@ -1697,7 +2096,7 @@ function renderIdentityBar() {
 
 function renderAskPage() {
   const role = persisted.role;
-  const target = role === "adult" ? "小朋友" : "大人";
+  const target = role === "adult" ? "小朋友" : "大朋友";
   const direction = role === "adult" ? "adult_to_child" : "child_to_adult";
   const draft = persisted.drafts.ask[role] || "";
   return `
@@ -1761,7 +2160,7 @@ function renderAskPage() {
 function renderPoolPage() {
   if (!persisted.role) return renderIdentityPage();
   const questions = getPoolQuestions();
-  const sourceRole = persisted.role === "adult" ? "小朋友" : "大人";
+  const sourceRole = persisted.role === "adult" ? "小朋友" : "大朋友";
   return `
     <div class="page-inner">
       <div class="page-heading-row">
@@ -1978,7 +2377,7 @@ function renderMinePage() {
         persisted.role
           ? renderIdentityBar()
           : `<div class="role-grid mine-role-grid">
-              ${roleChoice("adult", "user-round", "我是大人", "查看和管理大人身份下的参与记录")}
+              ${roleChoice("adult", "user-round", "我是大朋友", "查看和管理大朋友身份下的参与记录")}
               ${roleChoice("child", "user-round", "我是小朋友", "查看和管理小朋友身份下的参与记录")}
             </div>`
       }
@@ -2397,11 +2796,9 @@ function handleClick(event) {
     acknowledgeUnsavedReceipt();
   } else if (action === "navigate") {
     const route = target.dataset.route;
-    if (route === "participate" && !persisted.role) {
-      requestIdentity({ type: "navigate", route: "participate" });
-    } else {
-      navigate(route);
-    }
+    navigate(route);
+  } else if (action === "open-participation") {
+    openParticipationSheet();
   } else if (action === "go-back") {
     goBack(target.dataset.fallbackRoute || "wall");
   } else if (action === "landing-ask") {
@@ -2428,7 +2825,7 @@ function handleClick(event) {
     toggleFavorite(target.dataset.noteId);
     render();
   } else if (action === "share-note") {
-    void shareNote(target.dataset.noteId);
+    openShareSheet(target.dataset.noteId);
   } else if (action === "open-note") {
     if (target.dataset.noteContext === "favorite" && backend.enabled) {
       void openVerifiedFavoriteNote(target.dataset.noteId);
@@ -2526,6 +2923,7 @@ function acknowledgeUnsavedReceipt() {
 }
 
 function moveWall(delta) {
+  reconcileRecommendationHistory();
   if (delta < 0) {
     if (ui.recommendationComplete) {
       if (!ui.recommendationIds.length) return;
@@ -3073,26 +3471,30 @@ function openNote(noteId, { fromHistory = false } = {}) {
   const notes = getAvailableNotes();
   const note = findViewableNote(noteId);
   if (!note) return;
-  const group = notes.filter((item) => item.questionId === note.questionId);
+  const isPhoto = note.kind === "photo" && Boolean(note.mediaUrl);
+  const group = isPhoto ? [note] : notes.filter((item) => item.questionId === note.questionId);
   const otherAnswers = group.filter((item) => item.id !== note.id);
   const direction = directionMeta(note.direction);
   const favorite = persisted.favorites.includes(note.id);
+  dialog.dataset.noteId = note.id;
   dialogContent.innerHTML = `
     <div class="dialog-head">
-      <h2 id="note-dialog-title">问答便签</h2>
+      <h2 id="note-dialog-title">${isPhoto ? "实体便签" : "问答便签"}</h2>
       <button class="button icon-button button-ghost" type="button" data-dialog-action="close" aria-label="关闭">
         ${icon("x")}
       </button>
     </div>
     <div class="dialog-body">
-      <article class="detail-note note-template ${noteTemplateClass(note.direction)}">
-        <span class="direction-label ${direction.className}">${direction.label}</span>
-        <p class="detail-question">${escapeHtml(note.question)}</p>
-        <div class="answer-block answer-block-current">
-          <p class="answer-role">${note.direction === "adult_to_child" ? "小朋友说" : "大人说"}</p>
-          <p class="answer-text">${escapeHtml(note.answer)}</p>
-        </div>
-      </article>
+      ${isPhoto ? renderPhotoNoteDetail(note, direction) : `
+        <article class="detail-note note-template ${noteTemplateClass(note.direction)}">
+          <span class="direction-label ${direction.className}">${direction.label}</span>
+          <p class="detail-question">${escapeHtml(note.question)}</p>
+          <div class="answer-block answer-block-current">
+            <p class="answer-role">${note.direction === "adult_to_child" ? "小朋友说" : "大朋友说"}</p>
+            <p class="answer-text">${escapeHtml(note.answer)}</p>
+          </div>
+        </article>
+      `}
       ${
         otherAnswers.length
           ? `<section class="other-answers">
@@ -3100,7 +3502,7 @@ function openNote(noteId, { fromHistory = false } = {}) {
               ${otherAnswers
                 .map(
                   (item) => `<div class="answer-block">
-                    <p class="answer-role">${note.direction === "adult_to_child" ? "小朋友说" : "大人说"}</p>
+                    <p class="answer-role">${note.direction === "adult_to_child" ? "小朋友说" : "大朋友说"}</p>
                     <p class="answer-text">${escapeHtml(item.answer)}</p>
                   </div>`,
                 )
@@ -3109,10 +3511,10 @@ function openNote(noteId, { fromHistory = false } = {}) {
           : ""
       }
       <div class="dialog-actions">
-        <button class="button button-primary" type="button" data-dialog-action="answer" data-question-id="${escapeHtml(note.questionId)}">
+        ${isPhoto ? "" : `<button class="button button-primary" type="button" data-dialog-action="answer" data-question-id="${escapeHtml(note.questionId)}">
           ${icon("pen-line")}
           我也来回答
-        </button>
+        </button>`}
         <button class="button" type="button" data-dialog-action="favorite" data-note-id="${escapeHtml(note.id)}">
           ${icon(favorite ? "bookmark-check" : "bookmark")}
           ${favorite ? "已收藏" : "收藏"}
@@ -3141,7 +3543,25 @@ function openNote(noteId, { fromHistory = false } = {}) {
   }
 }
 
+function renderPhotoNoteDetail(note, direction) {
+  const altText = note.altText || `实体便签。问题：${note.question}。回答：${note.answer}`;
+  return `
+    <article class="detail-photo-note">
+      <img src="${escapeHtml(note.mediaUrl)}" alt="${escapeHtml(altText)}" decoding="async" referrerpolicy="no-referrer" />
+      <div class="detail-photo-transcript">
+        <span class="direction-label ${direction.className}">${direction.label}</span>
+        <p class="detail-question">${escapeHtml(note.question)}</p>
+        <div class="answer-block answer-block-current">
+          <p class="answer-role">${note.direction === "adult_to_child" ? "小朋友说" : "大朋友说"}</p>
+          <p class="answer-text">${escapeHtml(note.answer)}</p>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
 function closeNoteDialog() {
+  if (dialog.dataset) delete dialog.dataset.noteId;
   if (getNavigationSnapshot()?.overlayNoteId && navigationDepth > 0) {
     window.history.back();
     return;
@@ -3188,7 +3608,7 @@ function handleDialogClick(event) {
     toggleFavorite(target.dataset.noteId);
     openNote(target.dataset.noteId);
   } else if (action === "share") {
-    void shareNote(target.dataset.noteId);
+    openShareSheet(target.dataset.noteId);
   } else if (action === "report") {
     if (window.confirm("确认举报这张便签吗？")) {
       submitReport(target.dataset.noteId);
@@ -3243,6 +3663,7 @@ async function verifyPublicNote(noteId) {
     return { status: "unavailable", note: null };
   }
   if (!note) {
+    purgeUnavailablePublicNotes([id]);
     invalidateFavoriteNote(id);
     return { status: "missing", note: null };
   }
@@ -3312,6 +3733,119 @@ function toggleFavorite(noteId) {
   return index < 0;
 }
 
+function openShareSheet(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  const note = findViewableNote(id);
+  if (!id || !note) {
+    showToast("这张便签已经不可见。", true, 2400);
+    return;
+  }
+  if (!shareDialog || !shareDialogContent) {
+    void shareNote(id);
+    return;
+  }
+
+  shareDialog.dataset.noteId = id;
+  refreshShareSheet(id);
+  if (!shareDialog.open) shareDialog.showModal();
+  void prepareNoteForShare(id).then((result) => {
+    if (shareDialog.open && shareDialog.dataset.noteId === id) {
+      refreshShareSheet(id, result.status);
+    }
+  });
+}
+
+function refreshShareSheet(noteId, preparationStatus = "") {
+  if (!shareDialogContent) return;
+  const note = findViewableNote(noteId);
+  if (!note) {
+    shareDialogContent.innerHTML = `
+      <div class="action-sheet-handle" aria-hidden="true"></div>
+      <div class="action-sheet-head">
+        <div><h2 id="share-dialog-title">便签已经不可见</h2><p>可能已被作者或管理员下架。</p></div>
+        <button class="action-sheet-close" type="button" data-share-action="close" aria-label="关闭分享菜单">${icon("x")}</button>
+      </div>
+    `;
+    refreshIcons();
+    return;
+  }
+
+  const cached = getPreparedNoteShareImage(note);
+  const imageReady = Boolean(cached?.blob);
+  const imageFailed = preparationStatus === "ready" && cached && !cached.blob;
+  const isPhoto = note.kind === "photo";
+  const imageStatus = imageReady
+    ? `${isPhoto ? "实体便签原图" : "便签图片"}已准备好`
+    : imageFailed
+      ? "图片暂时无法生成，仍可复制链接"
+      : isPhoto
+        ? "正在读取实体便签原图…"
+        : "正在生成高清便签图片…";
+  shareDialogContent.innerHTML = `
+    <div class="action-sheet-handle" aria-hidden="true"></div>
+    <div class="action-sheet-head">
+      <div>
+        <p class="action-sheet-kicker">分享便签</p>
+        <h2 id="share-dialog-title">把喜欢的这一张带走</h2>
+        <p class="share-sheet-status${imageFailed ? " is-error" : ""}">${escapeHtml(imageStatus)}</p>
+      </div>
+      <button class="action-sheet-close" type="button" data-share-action="close" aria-label="关闭分享菜单">${icon("x")}</button>
+    </div>
+    <div class="action-sheet-options share-sheet-options">
+      <button class="action-sheet-option" type="button" data-share-action="share-image"${imageReady ? "" : " disabled"}>
+        <span class="action-sheet-option-icon">${icon(imageReady ? "share-2" : "loader-circle")}</span>
+        <span><strong>分享便签图片</strong><small>${imageReady ? "调起手机系统分享" : "图片准备好后即可使用"}</small></span>
+        ${icon("chevron-right")}
+      </button>
+      <button class="action-sheet-option" type="button" data-share-action="save-image"${imageReady ? "" : " disabled"}>
+        <span class="action-sheet-option-icon">${icon("download")}</span>
+        <span><strong>保存图片</strong><small>保存到手机后再发给朋友</small></span>
+        ${icon("chevron-right")}
+      </button>
+      <button class="action-sheet-option" type="button" data-share-action="copy-link">
+        <span class="action-sheet-option-icon">${icon("link")}</span>
+        <span><strong>复制链接</strong><small>链接会直接打开这张便签</small></span>
+        ${icon("chevron-right")}
+      </button>
+    </div>
+  `;
+  refreshIcons();
+}
+
+function closeShareSheet() {
+  if (shareDialog?.open) shareDialog.close();
+  if (shareDialog?.dataset) delete shareDialog.dataset.noteId;
+}
+
+function handleShareDialogCancel(event) {
+  event.preventDefault();
+  closeShareSheet();
+}
+
+function handleShareDialogClick(event) {
+  const target = event.target.closest("[data-share-action]");
+  if (!target) {
+    const rect = shareDialog.getBoundingClientRect();
+    const outside =
+      event.clientX < rect.left || event.clientX > rect.right ||
+      event.clientY < rect.top || event.clientY > rect.bottom;
+    if (outside) closeShareSheet();
+    return;
+  }
+
+  const noteId = shareDialog.dataset.noteId;
+  const action = target.dataset.shareAction;
+  if (action === "close") {
+    closeShareSheet();
+  } else if (action === "share-image") {
+    void sharePreparedNoteImage(noteId);
+  } else if (action === "save-image") {
+    savePreparedNoteImage(noteId);
+  } else if (action === "copy-link") {
+    void copyNoteLink(noteId);
+  }
+}
+
 async function prepareNoteForShare(noteId) {
   const id = normalizePublicNoteId(noteId);
   if (!id) return { status: "missing", note: null, imageBlob: null };
@@ -3356,7 +3890,13 @@ async function prepareNoteForShare(noteId) {
 }
 
 function noteShareContentKey(note) {
-  return JSON.stringify([note?.direction || "", note?.question || "", note?.answer || ""]);
+  return JSON.stringify([
+    note?.kind === "photo" ? "photo" : "text",
+    note?.direction || "",
+    note?.question || "",
+    note?.answer || "",
+    note?.kind === "photo" ? normalizePhotoMediaUrl(note?.mediaUrl || note?.imageUrl) : "",
+  ]);
 }
 
 function getPreparedNoteShareImage(note) {
@@ -3385,65 +3925,64 @@ function cachePreparedNoteShareImage(note, blob) {
 
 async function shareNote(noteId) {
   const id = normalizePublicNoteId(noteId);
-  const note = getFreshVerifiedPublicNote(id);
+  const result = await prepareNoteForShare(id);
+  if (result.status !== "ready" || !result.imageBlob) {
+    showToast(
+      result.status === "missing" ? "这张便签已下架，无法继续分享。" : "便签图片暂时无法生成。",
+      true,
+      2800,
+    );
+    return false;
+  }
+  return sharePreparedNoteImage(id);
+}
+
+async function sharePreparedNoteImage(noteId) {
+  const id = normalizePublicNoteId(noteId);
+  const note = findViewableNote(id);
   const prepared = note ? getPreparedNoteShareImage(note) : null;
-  if (!note || !prepared) {
-    const preparation = prepareNoteForShare(id);
-    showToast("正在准备便签图片…", false, 1800);
-    const result = await preparation;
-    if (result.status === "ready") {
-      showToast("便签已准备好，请再点一次分享。", false, 2600);
-    } else if (result.status === "missing") {
-      render();
-      showToast("这张便签已下架，无法继续分享。", true, 2800);
-    } else {
-      showToast("暂时无法确认便签状态，请稍后再试。", true, 2600);
-    }
-    return;
+  if (!note || !prepared?.blob) {
+    showToast("便签图片还没准备好，请稍候。", true, 2200);
+    return false;
   }
 
   const url = createWallShareUrl(note.id);
   const text = `问：${note.question}\n答：${note.answer}`;
   const imageBlob = prepared.blob;
 
-  if (!nativeShareUnavailable && typeof navigator.share === "function") {
+  if (
+    !nativeShareUnavailable &&
+    !nativeFileShareUnavailable &&
+    typeof navigator.share === "function" &&
+    typeof navigator.canShare === "function" &&
+    typeof File === "function"
+  ) {
     let file = null;
     let canShareFile = false;
-    if (
-      imageBlob &&
-      !nativeFileShareUnavailable &&
-      typeof navigator.canShare === "function" &&
-      typeof File === "function"
-    ) {
-      try {
-        file = new File([imageBlob], noteImageFilename(note), { type: "image/png" });
-        canShareFile = navigator.canShare({ files: [file] });
-        if (!canShareFile) nativeFileShareUnavailable = true;
-      } catch (error) {
-        nativeFileShareUnavailable = true;
-        console.warn("Unable to prepare the note image for native sharing.", error);
-      }
+    try {
+      file = new File([imageBlob], noteImageFilename(note, imageBlob), {
+        type: noteImageMimeType(imageBlob),
+      });
+      canShareFile = navigator.canShare({ files: [file] });
+      if (!canShareFile) nativeFileShareUnavailable = true;
+    } catch (error) {
+      nativeFileShareUnavailable = true;
+      console.warn("Unable to prepare the note image for native sharing.", error);
     }
 
     if (file && canShareFile) {
       const result = await attemptNativeShare({
-        title: "问问墙的一张便签",
+        title: `${BRAND_NAME}的一张便签`,
         text: `${text}\n${url}`,
         files: [file],
       });
-      if (result === "failed") {
-        nativeFileShareUnavailable = true;
-        showToast("图片分享未能打开，请再点一次分享文字和链接。", true, 3000);
+      if (result === "shared") {
+        closeShareSheet();
+        return true;
       }
-      return;
+      if (result === "aborted") return false;
+      nativeFileShareUnavailable = true;
     }
-
-    const result = await attemptNativeShare({ title: "问问墙的一张便签", text, url });
-    if (result === "failed") {
-      nativeShareUnavailable = true;
-      showToast("系统分享不可用，请再点一次分享按钮，复制链接并保存图片。", true, 3400);
-    }
-    return;
   }
 
   const copyPromise = copyShareText(`${text}\n${url}`);
@@ -3459,10 +3998,40 @@ async function shareNote(noteId) {
   const copied = await copyPromise;
 
   if (downloaded) {
-    showToast(copied ? "便签图片已保存，分享文字已复制。" : "便签图片已保存。", false, 2400);
+    showToast(copied ? "图片已保存，分享文字和链接已复制。" : "便签图片已保存。", false, 2600);
   } else {
     showToast(copied ? "便签文字和链接已复制。" : "暂时无法分享，请稍后再试。", !copied, 2200);
   }
+  return downloaded || copied;
+}
+
+function savePreparedNoteImage(noteId) {
+  const note = findViewableNote(noteId);
+  const prepared = note ? getPreparedNoteShareImage(note) : null;
+  if (!note || !prepared?.blob) {
+    showToast("便签图片还没准备好，请稍候。", true, 2200);
+    return false;
+  }
+  try {
+    downloadNoteImage(prepared.blob, note);
+    showToast("便签图片已保存。", false, 2000);
+    return true;
+  } catch (error) {
+    console.warn("Unable to download the note image.", error);
+    showToast("当前浏览器无法保存图片。", true, 2400);
+    return false;
+  }
+}
+
+async function copyNoteLink(noteId) {
+  const note = findViewableNote(noteId);
+  if (!note) {
+    showToast("这张便签已经不可见。", true, 2200);
+    return false;
+  }
+  const copied = await copyShareText(createWallShareUrl(note.id));
+  showToast(copied ? "便签链接已复制。" : "暂时无法复制，请稍后再试。", !copied, 2200);
+  return copied;
 }
 
 async function attemptNativeShare(payload) {
@@ -3485,13 +4054,20 @@ function createWallShareUrl(noteId) {
   return url.href;
 }
 
-function noteImageFilename(note) {
+function noteImageMimeType(blob) {
+  const mime = String(blob?.type || "").split(";", 1)[0].trim().toLowerCase();
+  return PHOTO_NOTE_MIME_EXTENSIONS[mime] ? mime : "image/png";
+}
+
+function noteImageFilename(note, blob = null) {
   const safeTitle = Array.from(note.question)
     .slice(0, 12)
     .join("")
     .replace(/[\\/:*?"<>|]/g, "")
     .trim();
-  return `问问墙-${safeTitle || "便签"}.png`;
+  const mime = noteImageMimeType(blob);
+  const extension = PHOTO_NOTE_MIME_EXTENSIONS[mime] || "png";
+  return `${BRAND_NAME}-${safeTitle || "便签"}.${extension}`;
 }
 
 async function copyShareText(text) {
@@ -3507,7 +4083,7 @@ function downloadNoteImage(blob, note) {
   const objectUrl = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = objectUrl;
-  link.download = noteImageFilename(note);
+  link.download = noteImageFilename(note, blob);
   link.rel = "noopener";
   document.body.appendChild(link);
   link.click();
@@ -3516,6 +4092,8 @@ function downloadNoteImage(blob, note) {
 }
 
 async function createNoteImageBlob(note) {
+  if (note?.kind === "photo") return loadPhotoNoteBlob(note);
+
   const template = noteExportTemplates[note.direction] || noteExportTemplates.child_to_adult;
   const image = await loadNoteTemplateImage(template.asset);
   const canvas = document.createElement("canvas");
@@ -3529,6 +4107,44 @@ async function createNoteImageBlob(note) {
   drawNoteCanvasText(context, note.answer, template.answer, template, 600);
 
   return canvasToPngBlob(canvas);
+}
+
+async function loadPhotoNoteBlob(note) {
+  const mediaUrl = normalizePhotoMediaUrl(note?.mediaUrl || note?.imageUrl);
+  if (!mediaUrl) throw new Error("The photographed note URL is not trusted.");
+
+  const response = await fetch(mediaUrl, {
+    cache: "force-cache",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+  });
+  if (!response.ok) throw new Error(`Unable to download the photographed note (${response.status}).`);
+  if (response.url && !normalizePhotoMediaUrl(response.url)) {
+    throw new Error("The photographed note redirected to an untrusted location.");
+  }
+
+  const headerMime = String(response.headers.get("content-type") || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (!PHOTO_NOTE_MIME_EXTENSIONS[headerMime]) {
+    throw new Error("The photographed note has an unsupported image type.");
+  }
+
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > PHOTO_NOTE_MAX_DOWNLOAD_BYTES) {
+    throw new Error("The photographed note is too large to share.");
+  }
+
+  const blob = await response.blob();
+  if (!blob.size || blob.size > PHOTO_NOTE_MAX_DOWNLOAD_BYTES) {
+    throw new Error("The photographed note is empty or too large to share.");
+  }
+  const blobMime = String(blob.type || headerMime).split(";", 1)[0].trim().toLowerCase();
+  if (!PHOTO_NOTE_MIME_EXTENSIONS[blobMime] || blobMime !== headerMime) {
+    throw new Error("The photographed note image type is inconsistent.");
+  }
+  return blob.type === headerMime ? blob : blob.slice(0, blob.size, headerMime);
 }
 
 function loadNoteTemplateImage(asset) {
@@ -3689,9 +4305,9 @@ function icon(name) {
 
 function directionMeta(direction) {
   if (direction === "adult_to_child") {
-    return { label: "大人问 → 小朋友答", className: "direction-adult" };
+    return { label: "大朋友问 → 小朋友答", className: "direction-adult" };
   }
-  return { label: "小朋友问 → 大人答", className: "direction-child" };
+  return { label: "小朋友问 → 大朋友答", className: "direction-child" };
 }
 
 function noteTemplateClass(direction) {
@@ -3699,7 +4315,7 @@ function noteTemplateClass(direction) {
 }
 
 function roleName(role) {
-  return role === "adult" ? "大人" : role === "child" ? "小朋友" : "游客";
+  return role === "adult" ? "大朋友" : role === "child" ? "小朋友" : "游客";
 }
 
 function formatDate(value) {

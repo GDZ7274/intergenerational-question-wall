@@ -26,20 +26,33 @@ function requiredEnvironment(name: string): string {
   return value;
 }
 
-function corsHeaders(request: Request): Record<string, string> {
-  const requestOrigin = request.headers.get("origin") || "*";
-  const configuredOrigins = (Deno.env.get("PHOTO_NOTE_ALLOWED_ORIGINS") || "")
+function configuredOrigins(): string[] {
+  return (Deno.env.get("PHOTO_NOTE_ALLOWED_ORIGINS") || "")
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
-  const allowOrigin = configuredOrigins.length === 0
-    ? requestOrigin
-    : configuredOrigins.includes(requestOrigin)
-    ? requestOrigin
-    : configuredOrigins[0];
+}
+
+function assertAllowedOrigin(request: Request): void {
+  const origins = configuredOrigins();
+  if (!origins.length) {
+    throw new HttpError(503, "origin_configuration_missing", "照片服务尚未配置允许访问的站点。");
+  }
+  const requestOrigin = request.headers.get("origin")?.trim() || "";
+  if (!requestOrigin) {
+    throw new HttpError(403, "origin_required", "照片服务请求缺少站点来源。");
+  }
+  if (!origins.includes(requestOrigin)) {
+    throw new HttpError(403, "origin_not_allowed", "当前站点不能调用照片服务。");
+  }
+}
+
+function corsHeaders(request: Request): Record<string, string> {
+  const requestOrigin = request.headers.get("origin")?.trim() || "";
+  const allowOrigin = configuredOrigins().includes(requestOrigin) ? requestOrigin : "";
 
   return {
-    "Access-Control-Allow-Origin": allowOrigin,
+    ...(allowOrigin ? { "Access-Control-Allow-Origin": allowOrigin } : {}),
     "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-client-info, x-upsert",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Max-Age": "86400",
@@ -100,6 +113,7 @@ function rpcFailure(error: { message?: string; code?: string } | null): never {
 async function authenticatedClients(request: Request): Promise<{
   userClient: SupabaseClient;
   serviceClient: SupabaseClient;
+  actorId: string;
 }> {
   const authorization = request.headers.get("authorization")?.trim() || "";
   if (!/^Bearer\s+\S+$/i.test(authorization)) {
@@ -129,7 +143,7 @@ async function authenticatedClients(request: Request): Promise<{
     throw new HttpError(403, "moderator_required", "当前账号没有实体便签管理权限。");
   }
 
-  return { userClient, serviceClient };
+  return { userClient, serviceClient, actorId: userData.user.id };
 }
 
 async function getPhotoNote(userClient: SupabaseClient, id: string): Promise<JsonObject> {
@@ -337,10 +351,27 @@ function extensionForMimeType(mimeType: string): string {
   return "jpg";
 }
 
+async function clearHiddenMediaReference(
+  serviceClient: SupabaseClient,
+  id: string,
+  actorId: string,
+): Promise<JsonObject> {
+  const { data, error } = await serviceClient.rpc("edge_moderate_photo_note", {
+    p_id: id,
+    p_action: "clear_media",
+    p_reason: null,
+    p_public_object_path: null,
+    p_actor_id: actorId,
+  });
+  if (error) rpcFailure(error);
+  return asObject(data);
+}
+
 async function publishPhotoNote(
   body: JsonObject,
   userClient: SupabaseClient,
   serviceClient: SupabaseClient,
+  actorId: string,
 ): Promise<JsonObject> {
   const id = asId(body.id);
   const note = await getPhotoNote(userClient, id);
@@ -361,11 +392,27 @@ async function publishPhotoNote(
     throw new HttpError(502, "publish_upload_failed", "公开图片写入失败，请重试。");
   }
 
-  const { data, error } = await userClient.rpc("admin_moderate_photo_note", {
+  const previousPublicPath = optionalString(note.publicObjectPath);
+  if (previousPublicPath && previousPublicPath !== publicPath) {
+    const { error: removePreviousError } = await serviceClient.storage
+      .from(PUBLIC_BUCKET)
+      .remove([previousPublicPath]);
+    if (removePreviousError) {
+      await serviceClient.storage.from(PUBLIC_BUCKET).remove([publicPath]);
+      throw new HttpError(
+        502,
+        "stale_public_media_cleanup_failed",
+        "旧公开图片清理失败，内容仍保持下架，请先重试清理。",
+      );
+    }
+  }
+
+  const { data, error } = await serviceClient.rpc("edge_moderate_photo_note", {
     p_id: id,
     p_action: note.status === "hidden" ? "publish" : "approve",
     p_reason: optionalString(body.reason),
     p_public_object_path: publicPath,
+    p_actor_id: actorId,
   });
   if (error) {
     await serviceClient.storage.from(PUBLIC_BUCKET).remove([publicPath]);
@@ -374,10 +421,6 @@ async function publishPhotoNote(
 
   const publicUrl = serviceClient.storage.from(PUBLIC_BUCKET).getPublicUrl(publicPath)
     .data.publicUrl;
-  const previousPublicPath = optionalString(note.publicObjectPath);
-  if (previousPublicPath && previousPublicPath !== publicPath) {
-    await serviceClient.storage.from(PUBLIC_BUCKET).remove([previousPublicPath]);
-  }
   return {
     ok: true,
     note: { ...asObject(data), publicUrl },
@@ -388,34 +431,46 @@ async function hidePhotoNote(
   body: JsonObject,
   userClient: SupabaseClient,
   serviceClient: SupabaseClient,
+  actorId: string,
 ): Promise<JsonObject> {
   const id = asId(body.id);
   const note = await getPhotoNote(userClient, id);
   const publicPath = optionalString(note.publicObjectPath);
-  const { data, error } = await userClient.rpc("admin_moderate_photo_note", {
+  const { data, error } = await serviceClient.rpc("edge_moderate_photo_note", {
     p_id: id,
     p_action: "hide",
     p_reason: optionalString(body.reason),
     p_public_object_path: null,
+    p_actor_id: actorId,
   });
   if (error) rpcFailure(error);
 
   let mediaRemoved = true;
+  let updatedNote = asObject(data);
   if (publicPath) {
     const { error: removeError } = await serviceClient.storage
       .from(PUBLIC_BUCKET)
       .remove([publicPath]);
     mediaRemoved = !removeError;
+    if (mediaRemoved) {
+      try {
+        updatedNote = await clearHiddenMediaReference(serviceClient, id, actorId);
+      } catch {
+        mediaRemoved = false;
+      }
+    }
   }
-  return { ok: true, note: asObject(data), mediaRemoved };
+  return { ok: true, note: updatedNote, mediaRemoved };
 }
 
 async function removeHiddenPublicMedia(
   body: JsonObject,
   userClient: SupabaseClient,
   serviceClient: SupabaseClient,
+  actorId: string,
 ): Promise<JsonObject> {
-  const note = await getPhotoNote(userClient, asId(body.id));
+  const id = asId(body.id);
+  const note = await getPhotoNote(userClient, id);
   if (note.status !== "hidden") {
     throw new HttpError(409, "not_hidden", "只有已隐藏的实体便签可以清理公开图片。");
   }
@@ -425,12 +480,54 @@ async function removeHiddenPublicMedia(
   if (error) {
     throw new HttpError(502, "media_cleanup_failed", "公开图片清理失败，请重试。");
   }
-  return { ok: true, mediaRemoved: true };
+  const updatedNote = await clearHiddenMediaReference(serviceClient, id, actorId);
+  return { ok: true, note: updatedNote, mediaRemoved: true };
+}
+
+async function hideReportedPhoto(
+  body: JsonObject,
+  serviceClient: SupabaseClient,
+  actorId: string,
+): Promise<JsonObject> {
+  const reportId = asId(body.reportId);
+  const { data, error } = await serviceClient.rpc("edge_hide_reported_photo", {
+    p_id: reportId,
+    p_note: optionalString(body.reason),
+    p_actor_id: actorId,
+  });
+  if (error) rpcFailure(error);
+  const report = asObject(data);
+  const photoNoteId = asId(report.photoNoteId);
+  const publicPath = optionalString(report.hiddenPublicObjectPath);
+
+  let mediaRemoved = true;
+  if (publicPath) {
+    const { error: removeError } = await serviceClient.storage
+      .from(PUBLIC_BUCKET)
+      .remove([publicPath]);
+    mediaRemoved = !removeError;
+    if (mediaRemoved) {
+      try {
+        await clearHiddenMediaReference(serviceClient, photoNoteId, actorId);
+      } catch {
+        mediaRemoved = false;
+      }
+    }
+  }
+  return { ok: true, report, mediaRemoved };
 }
 
 Deno.serve(async (request: Request) => {
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders(request) });
+    try {
+      assertAllowedOrigin(request);
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonResponse(request, { ok: false, error: error.code, message: error.message }, error.status);
+      }
+      return jsonResponse(request, { ok: false, error: "cors_failed", message: "来源校验失败。" }, 500);
+    }
   }
   if (request.method !== "POST") {
     return jsonResponse(request, {
@@ -441,13 +538,14 @@ Deno.serve(async (request: Request) => {
   }
 
   try {
+    assertAllowedOrigin(request);
     const contentLength = Number(request.headers.get("content-length") || 0);
     if (contentLength > 1024 * 1024) {
       throw new HttpError(413, "request_too_large", "请求内容过大。");
     }
     const body = asObject(await request.json());
     const action = typeof body.action === "string" ? body.action : "";
-    const { userClient, serviceClient } = await authenticatedClients(request);
+    const { userClient, serviceClient, actorId } = await authenticatedClients(request);
 
     let payload: JsonObject;
     switch (action) {
@@ -464,13 +562,16 @@ Deno.serve(async (request: Request) => {
         payload = await createPreview(body, userClient, serviceClient);
         break;
       case "publish":
-        payload = await publishPhotoNote(body, userClient, serviceClient);
+        payload = await publishPhotoNote(body, userClient, serviceClient, actorId);
         break;
       case "hide":
-        payload = await hidePhotoNote(body, userClient, serviceClient);
+        payload = await hidePhotoNote(body, userClient, serviceClient, actorId);
         break;
       case "removeHiddenPublicMedia":
-        payload = await removeHiddenPublicMedia(body, userClient, serviceClient);
+        payload = await removeHiddenPublicMedia(body, userClient, serviceClient, actorId);
+        break;
+      case "hideReportedPhoto":
+        payload = await hideReportedPhoto(body, serviceClient, actorId);
         break;
       default:
         throw new HttpError(400, "unsupported_action", "不支持的媒体操作。");

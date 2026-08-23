@@ -28,6 +28,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
@@ -48,6 +53,60 @@ jobs:
           test -f prototype/vendor/lucide.min.js
           test -f supabase/migrations/0003_operational_controls.sql
           test -f supabase/migrations/0004_release_hardening.sql
+          test -f supabase/migrations/0005_photo_notes.sql
+          test -f supabase/migrations/0006_photo_media_service_boundary.sql
+          test -f supabase/functions/photo-note-media/index.ts
+          node <<'NODE'
+          const fs = require("node:fs");
+          const migration = fs.readFileSync("supabase/migrations/0005_photo_notes.sql", "utf8");
+          const mediaBoundary = fs.readFileSync("supabase/migrations/0006_photo_media_service_boundary.sql", "utf8");
+          const edgeFunction = fs.readFileSync("supabase/functions/photo-note-media/index.ts", "utf8");
+          for (const marker of [
+            "create table if not exists public.photo_notes",
+            "'photo-note-staging'",
+            "'photo-note-public'",
+            "'photo'::text as kind",
+            "'schemaVersion', 4",
+            "'photoUploadMode', 'moderator_only'",
+            "when 'clear_media' then",
+          ]) {
+            if (!migration.includes(marker)) throw new Error(`Missing schema-v4 contract: ${marker}`);
+          }
+          for (const marker of [
+            "create or replace function public.edge_moderate_photo_note",
+            "create or replace function public.edge_hide_reported_photo",
+            "public media actions must use photo-note-media",
+            "'photoMediaServiceBoundaryVersion', 1",
+          ]) {
+            if (!mediaBoundary.includes(marker)) throw new Error(`Missing photo media service boundary: ${marker}`);
+          }
+          for (const marker of [
+            'requiredEnvironment("SUPABASE_SERVICE_ROLE_KEY")',
+            'userClient.rpc("admin_whoami")',
+            '.createSignedUploadUrl(',
+            '.createSignedUrl(',
+            'assertAllowedOrigin(request)',
+            'p_action: "clear_media"',
+          ]) {
+            if (!edgeFunction.includes(marker)) {
+              throw new Error(`Missing photo media security contract: ${marker}`);
+            }
+          }
+          for (const action of [
+            "createDraft",
+            "refreshUpload",
+            "completeDraft",
+            "preview",
+            "publish",
+            "hide",
+            "removeHiddenPublicMedia",
+            "hideReportedPhoto",
+          ]) {
+            if (!edgeFunction.includes(`case \"${action}\"`)) {
+              throw new Error(`Missing photo-note-media action: ${action}`);
+            }
+          }
+          NODE
 
       - name: Prepare site and runtime configuration
         shell: bash
@@ -98,13 +157,53 @@ jobs:
           node <<'NODE'
           const status = JSON.parse(process.env.MODERATION_STATUS || "null");
           if (
-            status?.schemaVersion !== 3 ||
+            status?.schemaVersion !== 4 ||
             status?.hardeningVersion !== 1 ||
-            status?.submissionsRequireReview !== true
+            status?.submissionsRequireReview !== true ||
+            status?.photoNotesEnabled !== true ||
+            status?.photoUploadMode !== "moderator_only" ||
+            status?.photoMediaServiceBoundaryVersion !== 1
           ) {
-            throw new Error("Supabase moderation/hardening migration is missing or incompatible.");
+            throw new Error("Supabase schema v4 or photo-note moderation is missing or incompatible.");
           }
           NODE
+
+      - name: Verify public photo-note projection
+        shell: bash
+        run: |
+          curl --fail --silent --show-error \
+            --header "apikey: ${SUPABASE_ANON_KEY}" \
+            --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            "${SUPABASE_URL}/rest/v1/wall_notes?select=note_id,kind,photo_note_id,media_bucket,media_path,alt_text,media_width,media_height&limit=1" \
+            >/dev/null
+
+      - name: Verify photo media function and CORS
+        shell: bash
+        run: |
+          PAGES_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          PAGES_ORIGIN="https://${PAGES_OWNER}.github.io"
+          HEADERS_FILE="$(mktemp)"
+          trap 'rm -f "${HEADERS_FILE}"' EXIT
+          HTTP_STATUS="$(
+            curl --silent --show-error \
+              --output /dev/null \
+              --dump-header "${HEADERS_FILE}" \
+              --write-out '%{http_code}' \
+              --request OPTIONS \
+              --header "Origin: ${PAGES_ORIGIN}" \
+              --header "Access-Control-Request-Method: POST" \
+              --header "Access-Control-Request-Headers: authorization,apikey,content-type" \
+              "${SUPABASE_URL}/functions/v1/photo-note-media"
+          )"
+          if [[ "${HTTP_STATUS}" != "200" && "${HTTP_STATUS}" != "204" ]]; then
+            echo "photo-note-media preflight failed with HTTP ${HTTP_STATUS}." >&2
+            exit 1
+          fi
+          if ! grep --fixed-strings --ignore-case --quiet \
+            "access-control-allow-origin: ${PAGES_ORIGIN}" "${HEADERS_FILE}"; then
+            echo "photo-note-media does not allow the GitHub Pages origin." >&2
+            exit 1
+          fi
 
       - name: Upload site
         uses: actions/upload-pages-artifact@v3

@@ -5,20 +5,34 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https://*.supabase.co; object-src 'none'; base-uri 'self'; form-action 'self'"
+      content="default-src 'self'; img-src 'self' data: blob: https://*.supabase.co; style-src 'self'; script-src 'self'; connect-src 'self' https://*.supabase.co; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
     <meta
       name="description"
-      content="大人和小朋友持续互相提问、回答和自由阅读的线上便利贴问答墙。"
+      content="大朋友和小朋友持续互相提问、回答和自由阅读的线上便利贴留言墙。"
     />
-    <title>问问墙</title>
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="解鸭留言墙" />
+    <meta property="og:title" content="【躺倒鸭】解鸭留言墙" />
+    <meta property="og:description" content="大朋友和小朋友持续互相提问、回答和自由阅读的线上便利贴留言墙。" />
+    <meta property="og:url" content="https://gdz7274.github.io/intergenerational-question-wall/" />
+    <meta property="og:image" content="https://gdz7274.github.io/intergenerational-question-wall/assets/hero-overlay.png" />
+    <meta property="og:image:width" content="1846" />
+    <meta property="og:image:height" content="852" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="【躺倒鸭】解鸭留言墙" />
+    <meta name="twitter:description" content="大朋友和小朋友持续互相提问、回答和自由阅读的线上便利贴留言墙。" />
+    <meta name="twitter:image" content="https://gdz7274.github.io/intergenerational-question-wall/assets/hero-overlay.png" />
+    <link rel="canonical" href="https://gdz7274.github.io/intergenerational-question-wall/" />
+    <title>【躺倒鸭】解鸭留言墙</title>
     <link rel="preload" href="assets/wall-scene.png" as="image" fetchpriority="high" />
     <link rel="preload" href="assets/hero-overlay.png" as="image" />
-    <link rel="stylesheet" href="styles.css?v=20" />
+    <link rel="stylesheet" href="styles.css?v=22" />
     <script defer src="vendor/lucide.min.js?v=1.8.0"></script>
     <script defer src="config.js?v=4"></script>
-    <script defer src="backend.js?v=4"></script>
-    <script defer src="app.js?v=21"></script>
+    <script defer src="backend.js?v=5"></script>
+    <script defer src="app.js?v=23"></script>
   </head>
   <body class="is-booting">
     <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -28,6 +42,14 @@
 
     <dialog id="note-dialog" class="note-dialog" aria-labelledby="note-dialog-title">
       <div id="note-dialog-content"></div>
+    </dialog>
+
+    <dialog id="participation-dialog" class="action-sheet-dialog" aria-labelledby="participation-dialog-title">
+      <div id="participation-dialog-content"></div>
+    </dialog>
+
+    <dialog id="share-dialog" class="action-sheet-dialog" aria-labelledby="share-dialog-title">
+      <div id="share-dialog-content"></div>
     </dialog>
 
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
