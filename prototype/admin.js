@@ -134,6 +134,7 @@
     photoRotation: 0,
     photoDraft: null,
     photoSubmitting: false,
+    photoNotesAvailable: false,
     photoPreviewUrls: new Map(),
     pendingPhotoEdit: null,
     pendingAction: null,
@@ -230,6 +231,7 @@
     state.runtimeSettings = null;
     state.rows = [];
     state.hasMore = false;
+    state.photoNotesAvailable = false;
     state.photoPreviewUrls.clear();
     state.pendingPhotoEdit = null;
     state.pendingAction = null;
@@ -1083,6 +1085,9 @@
     elements.workspaceEyebrow.textContent = eyebrow;
     elements.workspaceTitle.textContent = title;
     elements.tabs.forEach((tab) => {
+      if (["photo_capture", "photo_notes"].includes(tab.dataset.view)) {
+        tab.hidden = !state.photoNotesAvailable;
+      }
       if (tab.dataset.view === state.view) tab.setAttribute("aria-current", "page");
       else tab.removeAttribute("aria-current");
     });
@@ -1172,9 +1177,12 @@
       if (requestId !== state.workspaceRequestId) return;
 
       state.summary = summary || {};
+      state.photoNotesAvailable = Object.hasOwn(state.summary, "pendingPhotoNotes") ||
+        Object.hasOwn(state.summary, "pending_photo_notes");
       state.rows = Array.isArray(rows) ? rows : [];
       state.hasMore = state.rows.length === pageSize && !["runtime", "photo_capture"].includes(viewState.view);
       state.runtimeSettings = runtimeSettings;
+      updateViewChrome();
       renderSummary();
       renderRuntimeSettings();
       renderRows();
@@ -1763,6 +1771,7 @@
 
   function selectView(nextView) {
     if (!viewLabels[nextView] || (nextView === "runtime" && !isOwner())) return;
+    if (["photo_capture", "photo_notes"].includes(nextView) && !state.photoNotesAvailable) return;
     if (state.view === nextView) return;
     state.view = nextView;
     state.search = "";

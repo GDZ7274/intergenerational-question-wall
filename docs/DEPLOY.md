@@ -83,7 +83,9 @@ git push -u origin main
 | `SUPABASE_URL` | 是 | Supabase Project URL |
 | `SUPABASE_ANON_KEY` | 是 | Supabase Publishable key 或旧版 anon public key |
 
-生产部署固定使用审核模式，不再提供跳过审核的开关。必须执行到 `0006_photo_media_service_boundary.sql` 并部署媒体函数；Pages 部署任务只有在数据库返回 `schemaVersion: 4`、`hardeningVersion: 1`、`submissionsRequireReview: true`、`photoNotesEnabled: true`、`photoUploadMode: moderator_only` 和 `photoMediaServiceBoundaryVersion: 1` 时才继续。它还会验证 `wall_notes` 的照片列以及媒体函数对 Pages origin 的 CORS 预检。
+生产部署固定使用审核模式，不提供跳过审核的开关。Pages 支持渐进发布：只要数据库返回 `schemaVersion: 3`、`hardeningVersion: 1`、`submissionsRequireReview: true`，文字问答前台即可发布；此路径会自动隐藏照片采集/审核后台入口，并跳过照片投影与媒体函数 CORS 探针。它不启用任何照片能力。
+
+要启用照片能力，必须完成完整 schema v4：数据库还必须返回 `photoNotesEnabled: true`、`photoUploadMode: moderator_only` 和 `photoMediaServiceBoundaryVersion: 1`。Pages 只有在该 v4 条件成立时才执行 `wall_notes` 照片列和 `photo-note-media` 对 Pages origin 的 CORS 预检。schema v4 的正式后端发布仍必须顺序执行 `0005_photo_notes.sql`、`0006_photo_media_service_boundary.sql` 并部署 `photo-note-media` Edge Function；不能以跳过探针或仅推送前台的方式部分启用照片功能。
 
 `SUPABASE_ANON_KEY` 虽然放在 GitHub Variables 中，但部署后仍会出现在浏览器可读取的 `config.js` 里。这是 Supabase 公共前端密钥的正常用法，不代表它可以绕过 RLS。
 
@@ -100,7 +102,7 @@ git push -u origin main
 
 先以 `mode=preflight` 运行，检查 CLI 显示的远端迁移历史和 `db push --dry-run`。手动 `mode=deploy` 仍要求确认 `migration_history_confirmed`；而 `supabase-v*` 标签固定为 deploy，不读取这个复选项，但无论哪种路径，dry run 一旦显示会重放任一 `0001` 至 `0004` 迁移都会强制失败。早期通过 SQL Editor 手工执行的迁移通常不会自动进入 Supabase CLI 的迁移历史；应先备份数据库，并按 Supabase 官方 migration repair 流程核对、补齐历史，不能仅依赖勾选确认。
 
-推荐顺序是：在功能分支完成并提交迁移、Edge Function 与前端改动；先推送该功能分支，再从同一提交创建并推送一个未重复使用的 `supabase-v*` 标签。标签工作流先 dry run、拒绝旧迁移重放，再应用待执行迁移、设置函数 origin、部署 `photo-note-media`、验证 schema v4、公开照片投影和函数 CORS；成功并通过 Environment 审批后，才合并或推送 `main` 触发 Pages。preflight 不写远端数据；deploy 属于生产写入，必须经过 Environment 审批。不要把已用于生产的标签移动到其他提交。
+推荐顺序是：在功能分支完成并提交迁移、Edge Function 与前端改动；先推送该功能分支，再从同一提交创建并推送一个未重复使用的 `supabase-v*` 标签。标签工作流先 dry run、拒绝旧迁移重放，再应用待执行迁移、设置函数 origin、部署 `photo-note-media`、验证完整 schema v4、公开照片投影和函数 CORS；成功并通过 Environment 审批后，才合并或推送 `main` 触发 Pages。仅发布文字问答时，可以保留在 schema v3 + hardening 基线并直接发布 Pages；一旦计划启用照片，必须走前述完整 v4 后端发布。preflight 不写远端数据；deploy 属于生产写入，必须经过 Environment 审批。不要把已用于生产的标签移动到其他提交。
 
 ## 4. 启用并发布 Pages
 
@@ -113,7 +115,7 @@ git push -u origin main
    https://<你的用户名>.github.io/intergenerational-question-wall/
    ```
 
-工作流会运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs`，核对关键资源、schema-v4 迁移与 Edge Function 媒体动作契约，再验证远端 schema v4、公开照片列和函数 CORS。随后复制 `prototype/` 到临时发布目录，并用仓库变量生成仅用于线上 artifact 的 `config.js`。仓库中的 `prototype/config.js` 会继续保留空配置，方便本地演示，也避免把项目地址硬编码进源码。缺少变量、URL 不是托管 Supabase HTTPS 地址、数据库迁移不兼容或函数尚未部署时，工作流会主动失败。Pages 回滚不会回滚数据库、Storage 或 Edge Function。
+工作流会运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs`，核对关键资源、v4 迁移与 Edge Function 媒体动作契约，再验证远端审核基线。审核基线为 schema v3 + `hardeningVersion: 1` + `submissionsRequireReview: true`，通过后可发布文字问答前台；在此模式下照片后台会根据缺少的照片摘要字段自动隐藏，且不执行照片投影或函数 CORS 探针。若远端为完整 schema v4，工作流会额外验证照片投影和函数 CORS 后才启用照片能力。随后复制 `prototype/` 到临时发布目录，并用仓库变量生成仅用于线上 artifact 的 `config.js`。仓库中的 `prototype/config.js` 会继续保留空配置，方便本地演示，也避免把项目地址硬编码进源码。缺少变量、URL 不是托管 Supabase HTTPS 地址、审核基线不兼容，或完整 v4 的照片探针失败时，工作流会主动失败。Pages 回滚不会回滚数据库、Storage 或 Edge Function。
 
 当前公开页缓存版本为 `styles.css?v=22`、`app.js?v=23`、`backend.js?v=5`、`config.js?v=4`，后台为 `admin.css?v=6`、`admin.js?v=8`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 必须允许连接 Supabase API/Edge Function，并允许从受信 Supabase Storage 主机加载已发布照片；采集页的本地预览还需要 `blob:` 图片源。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
 

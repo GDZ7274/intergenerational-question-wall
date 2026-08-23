@@ -155,20 +155,24 @@ jobs:
           )"
           export MODERATION_STATUS
           node <<'NODE'
+          const fs = require("node:fs");
           const status = JSON.parse(process.env.MODERATION_STATUS || "null");
-          if (
-            status?.schemaVersion !== 4 ||
-            status?.hardeningVersion !== 1 ||
-            status?.submissionsRequireReview !== true ||
-            status?.photoNotesEnabled !== true ||
-            status?.photoUploadMode !== "moderator_only" ||
-            status?.photoMediaServiceBoundaryVersion !== 1
-          ) {
-            throw new Error("Supabase schema v4 or photo-note moderation is missing or incompatible.");
+          const commonReady = status?.hardeningVersion === 1 &&
+            status?.submissionsRequireReview === true;
+          const schemaV3Ready = commonReady && status?.schemaVersion === 3;
+          const schemaV4Ready = commonReady &&
+            status?.schemaVersion === 4 &&
+            status?.photoNotesEnabled === true &&
+            status?.photoUploadMode === "moderator_only" &&
+            status?.photoMediaServiceBoundaryVersion === 1;
+          if (!schemaV3Ready && !schemaV4Ready) {
+            throw new Error("Supabase moderation schema is missing or incompatible.");
           }
+          fs.appendFileSync(process.env.GITHUB_ENV, `PHOTO_NOTES_READY=${schemaV4Ready}\n`);
           NODE
 
       - name: Verify public photo-note projection
+        if: ${{ env.PHOTO_NOTES_READY == 'true' }}
         shell: bash
         run: |
           curl --fail --silent --show-error \
@@ -178,6 +182,7 @@ jobs:
             >/dev/null
 
       - name: Verify photo media function and CORS
+        if: ${{ env.PHOTO_NOTES_READY == 'true' }}
         shell: bash
         run: |
           PAGES_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"

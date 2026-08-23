@@ -130,6 +130,11 @@ function createAdminHarness({ fetch: fetchImpl = async () => ({ ok: true, status
   const ids = [...adminSource.matchAll(/document\.getElementById\("([^"]+)"\)/g)]
     .map((match) => match[1]);
   const elementsById = new Map(ids.map((id) => [id, createElement("div", id)]));
+  const queueTabs = ["questions", "photo_capture", "photo_notes"].map((view) => {
+    const tab = createElement("button", `tab-${view}`);
+    tab.dataset.view = view;
+    return tab;
+  });
   const selectorElements = new Map([
     [".workspace", createElement("main", "workspace")],
     ["[data-dialog-cancel]", createElement("button")],
@@ -158,7 +163,7 @@ function createAdminHarness({ fetch: fetchImpl = async () => ({ ok: true, status
       return selectorElements.get(selector) || null;
     },
     querySelectorAll(selector) {
-      return selector === ".queue-tab" ? [] : [];
+      return selector === ".queue-tab" ? queueTabs : [];
     },
     createElement(tagName) {
       return createElement(tagName);
@@ -180,9 +185,17 @@ function createAdminHarness({ fetch: fetchImpl = async () => ({ ok: true, status
     clearSession,
     signOut,
     resolvePhotoPreviewUrl,
+    performWorkspaceRefresh,
+    updateViewChrome,
+    selectView,
     appendPhotoNoteActions,
     executeAction,
     photoNoteBackend,
+    setWorkspaceLoaders({ summary, rows = [], runtimeSettings }) {
+      loadSummary = async () => summary;
+      loadCurrentView = async () => rows;
+      loadRuntimeSettings = async () => runtimeSettings;
+    },
     setRefreshWorkspace(replacement) { refreshWorkspace = replacement; },
   };
 })();`;
@@ -233,6 +246,7 @@ function createAdminHarness({ fetch: fetchImpl = async () => ({ ok: true, status
     sessionStorage,
     revokedUrls,
     fetchCalls,
+    queueTabs,
     createElement,
   };
 }
@@ -375,6 +389,84 @@ test("a private preview response cannot repopulate the cache after sign out", as
 
   await assert.rejects(pendingPreview, /登录会话已结束/);
   assert.equal(state.photoPreviewUrls.size, 0);
+});
+
+test("schema v3 admin dashboards hide and block photo capture and review views", async () => {
+  const harness = createAdminHarness();
+  const {
+    state,
+    performWorkspaceRefresh,
+    selectView,
+    setRefreshWorkspace,
+    setWorkspaceLoaders,
+  } = harness.api;
+  setWorkspaceLoaders({
+    summary: {
+      pendingQuestions: 1,
+      pendingAnswers: 2,
+      openReports: 3,
+      publishedNotes: 4,
+    },
+    rows: [],
+    runtimeSettings: {
+      submissionsPaused: false,
+      readOnly: false,
+      emergencyLockdown: false,
+      publicMessage: "",
+      updatedAt: null,
+    },
+  });
+  setRefreshWorkspace(async () => {});
+  state.workspaceRequestId = 7;
+
+  await performWorkspaceRefresh(7);
+
+  assert.equal(state.photoNotesAvailable, false);
+  assert.equal(harness.queueTabs.find((tab) => tab.dataset.view === "questions").hidden, false);
+  assert.equal(harness.queueTabs.find((tab) => tab.dataset.view === "photo_capture").hidden, true);
+  assert.equal(harness.queueTabs.find((tab) => tab.dataset.view === "photo_notes").hidden, true);
+  selectView("photo_capture");
+  assert.equal(state.view, "questions");
+  selectView("photo_notes");
+  assert.equal(state.view, "questions");
+});
+
+test("schema v4 admin dashboards expose photo capture and review views", async () => {
+  const harness = createAdminHarness();
+  const {
+    state,
+    performWorkspaceRefresh,
+    selectView,
+    setRefreshWorkspace,
+    setWorkspaceLoaders,
+  } = harness.api;
+  setWorkspaceLoaders({
+    summary: {
+      pendingQuestions: 1,
+      pendingAnswers: 2,
+      openReports: 3,
+      publishedNotes: 4,
+      pendingPhotoNotes: 0,
+    },
+    rows: [],
+    runtimeSettings: {
+      submissionsPaused: false,
+      readOnly: false,
+      emergencyLockdown: false,
+      publicMessage: "",
+      updatedAt: null,
+    },
+  });
+  setRefreshWorkspace(async () => {});
+  state.workspaceRequestId = 9;
+
+  await performWorkspaceRefresh(9);
+
+  assert.equal(state.photoNotesAvailable, true);
+  assert.equal(harness.queueTabs.find((tab) => tab.dataset.view === "photo_capture").hidden, false);
+  assert.equal(harness.queueTabs.find((tab) => tab.dataset.view === "photo_notes").hidden, false);
+  selectView("photo_capture");
+  assert.equal(state.view, "photo_capture");
 });
 
 test("hidden photo cleanup control invokes removeHiddenPublicMedia instead of the moderation RPC", async () => {
