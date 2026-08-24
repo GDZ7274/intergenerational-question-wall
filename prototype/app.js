@@ -2630,6 +2630,21 @@ function renderSubmissionPreviewDialog(item, type, note, publicNote) {
   `;
 }
 
+function submissionPreviewSignature(item, type, note, publicNote) {
+  return JSON.stringify({
+    type,
+    id: item?.id || "",
+    status: item?.status || "",
+    revision: Number(item?.revision || 0),
+    updatedAt: item?.updatedAt || "",
+    eventIds: normalizeEventIds(item?.eventIds),
+    question: note?.question || "",
+    answer: note?.answer || "",
+    noteId: note?.id || "",
+    publicNote: Boolean(publicNote),
+  });
+}
+
 function openSubmissionPreview(type, id) {
   const normalizedType = type === "answer" ? "answer" : "question";
   const item = findStoredSubmission(normalizedType, id);
@@ -2651,6 +2666,7 @@ function openSubmissionPreview(type, id) {
   // public-note history entry if the dialog is reused in the same session.
   if (dialog.dataset) delete dialog.dataset.noteId;
   dialog.dataset.submissionPreview = `${normalizedType}:${item.id}`;
+  dialog.dataset.submissionPreviewSignature = submissionPreviewSignature(item, normalizedType, note, publicNote);
   dialogContent.innerHTML = renderSubmissionPreviewDialog(item, normalizedType, note, publicNote);
   refreshIcons();
   dialog.scrollTop = 0;
@@ -2670,6 +2686,9 @@ function refreshOpenSubmissionPreview() {
   const publicNote = findSubmissionPublicNote(item, type);
   const note = createSubmissionPreviewNote(item, type);
   if (!note) return false;
+  const signature = submissionPreviewSignature(item, type, note, publicNote);
+  if (dialog.dataset.submissionPreviewSignature === signature) return false;
+  dialog.dataset.submissionPreviewSignature = signature;
   dialogContent.innerHTML = renderSubmissionPreviewDialog(item, type, note, publicNote);
   refreshIcons();
   dialog.scrollTop = 0;
@@ -3664,6 +3683,7 @@ function openNote(noteId, { fromHistory = false } = {}) {
   const note = findViewableNote(noteId);
   if (!note) return;
   if (dialog.dataset) delete dialog.dataset.submissionPreview;
+  if (dialog.dataset) delete dialog.dataset.submissionPreviewSignature;
   const isPhoto = note.kind === "photo" && Boolean(note.mediaUrl);
   const group = isPhoto ? [note] : notes.filter((item) => item.questionId === note.questionId);
   const otherAnswers = group.filter((item) => item.id !== note.id);
@@ -3757,6 +3777,7 @@ function closeNoteDialog() {
   const publicNoteOpen = Boolean(dialog.dataset?.noteId);
   if (dialog.dataset) delete dialog.dataset.noteId;
   if (dialog.dataset) delete dialog.dataset.submissionPreview;
+  if (dialog.dataset) delete dialog.dataset.submissionPreviewSignature;
   if (publicNoteOpen && getNavigationSnapshot()?.overlayNoteId && navigationDepth > 0) {
     window.history.back();
     return;
