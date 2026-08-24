@@ -115,6 +115,19 @@ test("shared notes are resolved through the public wall view", async () => {
   assert.equal(calls.length, 1);
 });
 
+test("public projection reads bypass browser cache for fresh approvals", async () => {
+  const { backend, calls } = loadBackend([
+    jsonResponse([]),
+    jsonResponse([]),
+  ]);
+
+  await backend.loadContent();
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.cache, "no-store");
+  assert.equal(calls[1].options.cache, "no-store");
+});
+
 test("saved note ids are batch-validated through the public wall view", async () => {
   const { backend, calls } = loadBackend([
     jsonResponse([

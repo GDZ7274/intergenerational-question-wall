@@ -31,6 +31,10 @@
       method: options.method || "GET",
       headers: requestHeaders(options.prefer),
       body: options.body ? JSON.stringify(options.body) : undefined,
+      // Public wall projections are polled on mobile. Do not let a WebView or
+      // an intermediary reuse an older GET response after a newly approved
+      // answer is published.
+      cache: options.cache || "no-store",
     });
 
     if (!response.ok) {
@@ -189,7 +193,16 @@
     };
   }
 
-  async function createAnswer({ questionId, authorSessionId, authorRole, body, anonymous }) {
+  async function createAnswer({
+    questionId,
+    authorSessionId,
+    authorRole,
+    body,
+    anonymous,
+    questionBody = "",
+    direction = "",
+    targetRole = "",
+  }) {
     const result = await rpc("submit_answer", {
       p_session_id: authorSessionId,
       p_question_id: questionId,
@@ -200,6 +213,9 @@
     return {
       id: result.id,
       questionId,
+      questionBody,
+      direction,
+      targetRole,
       status: result.status || "pending",
       createdAt: result.createdAt || new Date().toISOString(),
       receipt: result.receipt,

@@ -255,6 +255,91 @@ test("runtime sync fetches content with unchanged switches and renders only for 
   ]);
 });
 
+test("runtime sync refreshes the question author's receipt events", async () => {
+  const calls = { status: 0, content: 0, receipt: 0, render: 0 };
+  const backend = {
+    enabled: true,
+    experienceMode: false,
+    async loadRuntimeStatus() {
+      calls.status += 1;
+      return runtimeStatus();
+    },
+    async loadContent() {
+      calls.content += 1;
+      return { notes: [], questions: [] };
+    },
+    async getSubmissionStatus(receipt) {
+      calls.receipt += 1;
+      assert.equal(receipt, "a".repeat(64));
+      return {
+        ok: true,
+        type: "question",
+        id: "question-owned-1",
+        status: "open",
+        body: "你希望另一代理解什么？",
+        authorRole: "adult",
+        targetRole: "child",
+        direction: "adult_to_child",
+        anonymous: true,
+        revision: 1,
+        createdAt: "2026-08-23T09:00:00.000Z",
+        updatedAt: "2026-08-23T10:00:00.000Z",
+        events: [{
+          id: 17,
+          type: "answer_received",
+          message: "你的问题收到了一条新回答。",
+          createdAt: "2026-08-23T10:00:00.000Z",
+        }],
+      };
+    },
+  };
+  const { sandbox } = createHarness(backend);
+  sandbox.__calls = calls;
+  vm.runInContext(
+    `runtimeStatus = ${JSON.stringify(runtimeStatus())};
+     remoteNotes = [];
+     remoteQuestions = [];
+     remoteAvailable = true;
+     remoteLoadFailed = false;
+     persisted.myQuestions = [{
+       id: "question-owned-1",
+       body: "你希望另一代理解什么？",
+       direction: "adult_to_child",
+       askerRole: "adult",
+       targetRole: "child",
+       status: "open",
+       answerCount: 0,
+       anonymous: true,
+       createdAt: "2026-08-23T09:00:00.000Z",
+       receipt: "${"a".repeat(64)}",
+       eventIds: [],
+       latestEvent: null
+     }];
+     persisted.myAnswers = [];
+     persisted.notifications = [];
+     render = () => { __calls.render += 1; };`,
+    sandbox,
+  );
+
+  await vm.runInContext("syncRuntimeStatus()", sandbox);
+  assert.equal(calls.status, 1);
+  assert.equal(calls.content, 1);
+  assert.equal(calls.receipt, 1, "runtime sync should poll tracked receipt events");
+  assert.equal(calls.render, 1, "a new receipt event should refresh the visible page");
+  assert.equal(
+    vm.runInContext("persisted.notifications[0].title", sandbox),
+    "问题收到新回答",
+  );
+  assert.equal(vm.runInContext("ui.statusSyncing", sandbox), false);
+
+  // The same event is idempotent: the next interval must not duplicate the
+  // notification or cause a second render.
+  await vm.runInContext("syncRuntimeStatus()", sandbox);
+  assert.equal(calls.receipt, 2);
+  assert.equal(calls.render, 1);
+  assert.equal(vm.runInContext("persisted.notifications.length", sandbox), 1);
+});
+
 test("routine content removal purges wall history, the open detail, and the share sheet", async () => {
   const removed = textNote("note-remove-1");
   const survivor = textNote("note-remove-2");

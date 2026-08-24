@@ -2561,6 +2561,84 @@ h1 {
   }
 }
 
+/* Submission previews: a private answer can be watched immediately, while a
+ * question preview turns into the public note as soon as a response arrives. */
+.dialog-kicker {
+  margin: 0 0 3px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.submission-preview-body {
+  display: grid;
+  gap: 14px;
+}
+
+.submission-preview-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.submission-preview-meta p,
+.submission-preview-caption {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.submission-preview-meta p {
+  flex: 1 1 auto;
+  text-align: right;
+}
+
+.detail-note.note-template.submission-preview-note {
+  width: min(100%, 430px);
+  margin: 0 auto;
+}
+
+.detail-note.note-template.submission-preview-note .submission-preview-question {
+  font-size: 20px;
+  font-weight: 780;
+  line-height: 1.5;
+}
+
+.detail-note.note-template.submission-preview-note .submission-preview-answer {
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.6;
+}
+
+.detail-note.note-template.submission-preview-note .submission-preview-answer-waiting {
+  opacity: 0.62;
+  font-style: italic;
+}
+
+@media (max-width: 600px) {
+  .submission-preview-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .submission-preview-meta p {
+    text-align: left;
+  }
+
+  .detail-note.note-template.submission-preview-note .submission-preview-question {
+    font-size: 18px;
+  }
+
+  .detail-note.note-template.submission-preview-note .submission-preview-answer {
+    font-size: 14px;
+  }
+}
+
 /* Mobile swipe-first interaction refinements */
 .single-note-gesture-hint {
   display: inline-flex;
@@ -3189,6 +3267,17 @@ button:disabled,
 .receipt-import summary svg,
 .receipt-code summary svg,
 .submission-actions .button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.submission-preview-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.submission-preview-button svg {
   width: 16px;
   height: 16px;
 }

@@ -277,6 +277,155 @@ test("question and answer forms edit directly inside the note without preview se
   assert.match(answerHtml, /data-note-kind="answer"/);
 });
 
+test("my submissions expose a one-tap watch action and answer previews render locally", () => {
+  const { sandbox, dialog, dialogContent } = createHarness({
+    persistedState: {
+      role: "adult",
+      favorites: [],
+      myQuestions: [],
+      myAnswers: [{
+        id: "answer-local-01",
+        questionId: "question-local-01",
+        questionBody: "大人也会害怕重新开始吗？",
+        body: "会，但可以先迈出很小的一步。",
+        role: "adult",
+        status: "pending",
+        anonymous: true,
+        createdAt: "2026-08-24T10:00:00+08:00",
+      }],
+      notifications: [],
+      drafts: { ask: { adult: "", child: "" }, answer: {} },
+    },
+  });
+
+  const rowActions = vm.runInContext(
+    'renderSubmissionActions(persisted.myAnswers[0], "answer")',
+    sandbox,
+  );
+  assert.match(rowActions, /data-action="view-submission"/);
+  assert.match(rowActions, /观看回答便签/);
+
+  vm.runInContext('openSubmissionPreview("answer", "answer-local-01")', sandbox);
+  assert.equal(dialog.open, true);
+  assert.match(dialogContent.innerHTML, /观看便签/);
+  assert.match(dialogContent.innerHTML, /大人也会害怕重新开始吗？/);
+  assert.match(dialogContent.innerHTML, /会，但可以先迈出很小的一步。/);
+  assert.match(dialogContent.innerHTML, /仅自己可见|审核通过后/);
+  assert.match(dialogContent.innerHTML, /submission-preview-note/);
+});
+
+test("answer previews keep the linked question direction immediately after submit", () => {
+  const { sandbox, dialogContent } = createHarness({
+    backend: { enabled: true, experienceMode: false },
+    persistedState: {
+      role: "adult",
+      favorites: [],
+      myQuestions: [],
+      myAnswers: [{
+        id: "answer-local-direction",
+        questionId: "question-child-direction",
+        questionBody: "大人小时候也会害怕吗？",
+        body: "会，也可以找一个值得信任的人聊聊。",
+        role: "adult",
+        status: "pending",
+        anonymous: true,
+      }],
+      notifications: [],
+      drafts: { ask: { adult: "", child: "" }, answer: {} },
+    },
+  });
+  vm.runInContext(`remoteAvailable = true; remoteNotes = []; remoteQuestions = [{
+    id: "question-child-direction",
+    direction: "child_to_adult",
+    askerRole: "child",
+    targetRole: "adult",
+    body: "大人小时候也会害怕吗？",
+    status: "open",
+    answerCount: 0,
+    createdAt: "2026-08-24T10:00:00Z"
+  }];`, sandbox);
+  vm.runInContext('openSubmissionPreview("answer", "answer-local-direction")', sandbox);
+  assert.match(dialogContent.innerHTML, /小朋友问 → 大朋友答/);
+  assert.doesNotMatch(dialogContent.innerHTML, /大朋友问 → 小朋友答/);
+});
+
+test("a question can be watched before an answer arrives and keeps a waiting state", () => {
+  const { sandbox, dialogContent } = createHarness({
+    persistedState: {
+      role: "child",
+      favorites: [],
+      myQuestions: [{
+        id: "question-local-02",
+        body: "你小时候最想有人先听你说什么？",
+        direction: "child_to_adult",
+        askerRole: "child",
+        targetRole: "adult",
+        status: "open",
+        anonymous: true,
+        createdAt: "2026-08-24T10:00:00+08:00",
+      }],
+      myAnswers: [],
+      notifications: [],
+      drafts: { ask: { adult: "", child: "" }, answer: {} },
+    },
+  });
+
+  vm.runInContext('openSubmissionPreview("question", "question-local-02")', sandbox);
+  assert.match(dialogContent.innerHTML, /观看便签/);
+  assert.match(dialogContent.innerHTML, /你小时候最想有人先听你说什么？/);
+  assert.match(dialogContent.innerHTML, /等待对方回答/);
+  assert.match(dialogContent.innerHTML, /submission-preview-answer-waiting/);
+});
+
+test("an open question preview updates when its published answer arrives", () => {
+  const { sandbox, dialogContent } = createHarness({
+    backend: { enabled: true, experienceMode: false },
+    persistedState: {
+      role: "adult",
+      favorites: [],
+      myQuestions: [{
+        id: "question-live-preview",
+        body: "你小时候最喜欢的游戏是什么？",
+        direction: "adult_to_child",
+        askerRole: "adult",
+        targetRole: "child",
+        status: "open",
+        anonymous: true,
+        createdAt: "2026-08-24T10:00:00Z",
+      }],
+      myAnswers: [],
+      notifications: [],
+      drafts: { ask: { adult: "", child: "" }, answer: {} },
+    },
+  });
+  vm.runInContext("remoteAvailable = true; remoteNotes = [];", sandbox);
+  vm.runInContext('openSubmissionPreview("question", "question-live-preview")', sandbox);
+  assert.match(dialogContent.innerHTML, /等待对方回答/);
+  vm.runInContext(`remoteNotes = [{
+    id: "note-live-preview",
+    questionId: "question-live-preview",
+    answerId: "answer-live-preview",
+    direction: "adult_to_child",
+    question: "你小时候最喜欢的游戏是什么？",
+    answer: "我最喜欢和朋友一起跳皮筋。",
+    createdAt: "2026-08-24T11:00:00Z",
+    answerCount: 1
+  }]; refreshOpenSubmissionPreview()`, sandbox);
+  assert.match(dialogContent.innerHTML, /我最喜欢和朋友一起跳皮筋/);
+  assert.doesNotMatch(dialogContent.innerHTML, /等待对方回答/);
+});
+
+test("submission preview keeps question typography larger than answer typography", () => {
+  assert.match(
+    stylesSource,
+    /detail-note\.note-template\.submission-preview-note \.submission-preview-question\s*\{[^}]*font-size:\s*20px;/,
+  );
+  assert.match(
+    stylesSource,
+    /detail-note\.note-template\.submission-preview-note \.submission-preview-answer\s*\{[^}]*font-size:\s*15px;/,
+  );
+});
+
 test("mobile composer keeps a 16px native input while scaling the full editing layer", () => {
   assert.match(stylesSource, /\.composer-note-input \{[\s\S]*?font-size: 16px;/);
   assert.match(

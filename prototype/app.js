@@ -639,6 +639,17 @@ async function syncRuntimeStatus() {
         }
       }
 
+      // Submission events are protected by the recovery receipt and are not part
+      // of the public wall projection. Keep them on the same focus/visibility/
+      // interval sync as public content so a question author can see that a
+      // response arrived without having to press the manual button in “我的”.
+      const submissionChanged = await refreshSubmissionStatuses({
+        silent: true,
+        renderAfter: false,
+      });
+      const submissionPreviewChanged = refreshOpenSubmissionPreview();
+      shouldRender = shouldRender || submissionChanged || submissionPreviewChanged;
+
       if (shouldRender) render();
     } catch (error) {
       if (!remoteAvailable) {
@@ -926,6 +937,12 @@ function normalizeStoredAnswers(value) {
       id: typeof item.id === "string" ? item.id : `answer-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       questionId: typeof item.questionId === "string" ? item.questionId : "",
       questionBody: typeof item.questionBody === "string" ? item.questionBody : "",
+      // Keep the question direction with the local answer record.  Older records did
+      // not have it, so the preview helper below can still infer it from the author role.
+      direction: item.direction === "adult_to_child" || item.direction === "child_to_adult"
+        ? item.direction
+        : "",
+      targetRole: item.targetRole === "adult" || item.targetRole === "child" ? item.targetRole : "",
       body: item.body,
       role: item.role === "adult" ? "adult" : "child",
       anonymous: item.anonymous !== false,
@@ -2495,11 +2512,17 @@ function renderSubmissionRow(item, type) {
 }
 
 function renderSubmissionActions(item, type) {
+  const previewLabel = type === "answer" ? "观看回答便签" : "观看提问便签";
+  const previewButton = `
+    <button class="button button-ghost submission-preview-button" type="button" data-action="view-submission" data-type="${type}" data-id="${escapeHtml(item.id)}" aria-label="${previewLabel}">
+      ${icon("eye")} ${previewLabel}
+    </button>`;
   if (!item.receipt) {
-    return `<p class="submission-legacy">旧版本机记录，无法同步线上状态</p>`;
+    return `<div class="submission-actions">${previewButton}</div><p class="submission-legacy">旧版本机记录，无法同步线上状态</p>`;
   }
   return `
     <div class="submission-actions">
+      ${previewButton}
       ${
         item.status === "rejected"
           ? `<button class="button button-primary" type="button" data-action="edit-submission" data-type="${type}" data-id="${item.id}">
@@ -2516,6 +2539,141 @@ function renderSubmissionActions(item, type) {
       </details>
     </div>
   `;
+}
+
+function submissionPreviewDirection(item, type) {
+  if (item?.direction === "adult_to_child" || item?.direction === "child_to_adult") {
+    return item.direction;
+  }
+  // Older locally saved answers did not keep the direction. Recover it from
+  // the linked question before falling back to the answerer's role; the latter
+  // alone is not enough to tell which side asked the question.
+  if (type === "answer" && item?.questionId) {
+    const linkedQuestion = [
+      ...persisted.myQuestions,
+      ...getAvailableQuestions(),
+      ...getAvailableNotes(),
+    ].find((entry) => entry?.id === item.questionId || entry?.questionId === item.questionId);
+    if (linkedQuestion?.direction === "adult_to_child" || linkedQuestion?.direction === "child_to_adult") {
+      return linkedQuestion.direction;
+    }
+  }
+  const role = type === "question" ? item?.askerRole : item?.role;
+  return role === "adult" ? "adult_to_child" : "child_to_adult";
+}
+
+function findSubmissionPublicNote(item, type) {
+  if (!item) return null;
+  const id = typeof item.id === "string" ? item.id : "";
+  const candidates = getAvailableNotes().filter((note) =>
+    type === "question" ? note.questionId === id : note.answerId === id,
+  );
+  return candidates.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0] || null;
+}
+
+function createSubmissionPreviewNote(item, type) {
+  if (!item) return null;
+  const publicNote = findSubmissionPublicNote(item, type);
+  if (publicNote) return publicNote;
+  const question = type === "question" ? item.body : item.questionBody;
+  if (!question) return null;
+  const direction = submissionPreviewDirection(item, type);
+  return {
+    id: `submission-preview-${type}-${item.id}`,
+    questionId: item.questionId || (type === "question" ? item.id : null),
+    answerId: type === "answer" ? item.id : null,
+    direction,
+    question,
+    answer: type === "answer" ? item.body : "等待对方回答",
+    createdAt: item.createdAt || new Date().toISOString(),
+    answerCount: type === "answer" ? 1 : 0,
+    source: "submission-preview",
+  };
+}
+
+function renderSubmissionPreviewDialog(item, type, note, publicNote) {
+  const direction = directionMeta(note.direction);
+  const isAnswer = type === "answer";
+  const waiting = !isAnswer && !publicNote;
+  const subject = isAnswer ? "我的回答" : "我的提问";
+  const answerRole = note.direction === "adult_to_child" ? "小朋友说" : "大朋友说";
+  const statusCopy = publicNote
+    ? "这张便签已经发布在问答墙上。"
+    : isAnswer
+      ? "这是你的回答预览，审核通过后会贴到问答墙。"
+      : "这是你的提问预览，收到回答后会自动更新。";
+  return `
+    <div class="dialog-head">
+      <div>
+        <p class="dialog-kicker">${subject}</p>
+        <h2 id="note-dialog-title">观看便签</h2>
+      </div>
+      <button class="button icon-button button-ghost" type="button" data-dialog-action="close" aria-label="关闭">
+        ${icon("x")}
+      </button>
+    </div>
+    <div class="dialog-body submission-preview-body">
+      <div class="submission-preview-meta">
+        ${statusLabel(item.status || (publicNote ? "published" : "pending"))}
+        <p>${escapeHtml(statusCopy)}</p>
+      </div>
+      <article class="detail-note note-template ${noteTemplateClass(note.direction)} submission-preview-note">
+        <span class="direction-label ${direction.className}">${direction.label}</span>
+        <p class="detail-question submission-preview-question">${escapeHtml(note.question)}</p>
+        <div class="answer-block answer-block-current">
+          <p class="answer-role">${answerRole}</p>
+          <p class="answer-text submission-preview-answer${waiting ? " submission-preview-answer-waiting" : ""}">${escapeHtml(note.answer)}</p>
+        </div>
+      </article>
+      <p class="submission-preview-caption">${waiting ? "回答出现后，这张预览会随状态同步变成完整问答便签。" : "问题和回答会保留不同字号，阅读时更容易分辨。"}</p>
+    </div>
+  `;
+}
+
+function openSubmissionPreview(type, id) {
+  const normalizedType = type === "answer" ? "answer" : "question";
+  const item = findStoredSubmission(normalizedType, id);
+  if (!item) {
+    showToast("找不到这条投稿记录。", true, 2200);
+    return;
+  }
+  const publicNote = findSubmissionPublicNote(item, normalizedType);
+  if (publicNote) {
+    openNote(publicNote.id);
+    return;
+  }
+  const note = createSubmissionPreviewNote(item, normalizedType);
+  if (!note || !dialogContent) {
+    showToast("这条投稿暂时无法预览。", true, 2200);
+    return;
+  }
+  // A private preview is not a shareable note and must not inherit an old
+  // public-note history entry if the dialog is reused in the same session.
+  if (dialog.dataset) delete dialog.dataset.noteId;
+  dialog.dataset.submissionPreview = `${normalizedType}:${item.id}`;
+  dialogContent.innerHTML = renderSubmissionPreviewDialog(item, normalizedType, note, publicNote);
+  refreshIcons();
+  dialog.scrollTop = 0;
+  if (!dialog.open) dialog.showModal();
+  dialog.scrollTop = 0;
+}
+
+function refreshOpenSubmissionPreview() {
+  if (!dialog?.open || !dialog.dataset?.submissionPreview || !dialogContent) return false;
+  const key = String(dialog.dataset.submissionPreview);
+  const separator = key.indexOf(":");
+  if (separator < 1) return false;
+  const type = key.slice(0, separator) === "answer" ? "answer" : "question";
+  const id = key.slice(separator + 1);
+  const item = findStoredSubmission(type, id);
+  if (!item) return false;
+  const publicNote = findSubmissionPublicNote(item, type);
+  const note = createSubmissionPreviewNote(item, type);
+  if (!note) return false;
+  dialogContent.innerHTML = renderSubmissionPreviewDialog(item, type, note, publicNote);
+  refreshIcons();
+  dialog.scrollTop = 0;
+  return true;
 }
 
 function renderResubmitForm(item, type) {
@@ -2602,6 +2760,8 @@ function applySubmissionStatus(result, receipt) {
         questionBody: result.questionBody,
         body: result.body,
         role: result.authorRole,
+        direction: result.direction || "",
+        targetRole: result.targetRole || "",
       };
     }
     list.unshift(item);
@@ -2656,6 +2816,8 @@ function applySubmissionStatus(result, receipt) {
       questionId: result.questionId,
       questionBody: result.questionBody,
       role: result.authorRole,
+      direction: result.direction || item.direction || "",
+      targetRole: result.targetRole || item.targetRole || "",
     });
   }
 
@@ -2679,30 +2841,40 @@ function submissionEventTitle(type, eventType) {
 }
 
 async function refreshSubmissionStatuses({ silent = false, renderAfter = true } = {}) {
-  if (!backend.enabled || ui.statusSyncing) return;
+  if (!backend.enabled || ui.statusSyncing) return false;
   const tracked = [...persisted.myQuestions, ...persisted.myAnswers].filter((item) => item.receipt);
   if (!tracked.length) {
     if (!silent) showToast("还没有可以同步的线上投稿。", false, 1800);
-    return;
+    return false;
   }
 
+  const beforeSignature = submissionSyncSignature();
   ui.statusSyncing = true;
   if (renderAfter && ui.route === "mine") render();
-  const results = await Promise.allSettled(
-    tracked.map(async (item) => ({
-      receipt: item.receipt,
-      status: await backend.getSubmissionStatus(item.receipt),
-    })),
-  );
+  let results = [];
   let updated = 0;
-  results.forEach((result) => {
-    if (result.status !== "fulfilled") return;
-    applySubmissionStatus(result.value.status, result.value.receipt);
-    updated += 1;
-  });
-  savePersistedState();
-  ui.statusSyncing = false;
+  try {
+    results = await Promise.allSettled(
+      tracked.map(async (item) => ({
+        receipt: item.receipt,
+        status: await backend.getSubmissionStatus(item.receipt),
+      })),
+    );
+    results.forEach((result) => {
+      if (result.status !== "fulfilled") return;
+      applySubmissionStatus(result.value.status, result.value.receipt);
+      updated += 1;
+    });
+    savePersistedState();
+  } finally {
+    // A malformed response or a rendering/storage edge case must not leave the
+    // sync lock stuck on mobile, where the user may otherwise lose refreshes.
+    ui.statusSyncing = false;
+  }
+  const previewChanged = refreshOpenSubmissionPreview();
   if (renderAfter && ui.route === "mine") render();
+
+  const changed = beforeSignature !== submissionSyncSignature() || previewChanged;
 
   if (!silent) {
     const failed = results.length - updated;
@@ -2712,6 +2884,17 @@ async function refreshSubmissionStatuses({ silent = false, renderAfter = true } 
       2400,
     );
   }
+  return changed;
+}
+
+function submissionSyncSignature() {
+  // Only compare the state that status polling is allowed to mutate. Drafts,
+  // favorites and identity changes should not force a wall re-render here.
+  return JSON.stringify({
+    questions: persisted.myQuestions,
+    answers: persisted.myAnswers,
+    notifications: persisted.notifications,
+  });
 }
 
 async function importSubmissionReceipt(form) {
@@ -2834,6 +3017,8 @@ function handleClick(event) {
     } else {
       openNote(target.dataset.noteId);
     }
+  } else if (action === "view-submission") {
+    openSubmissionPreview(target.dataset.type, target.dataset.id);
   } else if (action === "answer-question") {
     beginAnswerQuestion(target.dataset.questionId);
   } else if (action === "random-question") {
@@ -3340,6 +3525,8 @@ async function submitAnswer(form) {
     id: globalThis.crypto?.randomUUID?.() || `answer-${Date.now()}`,
     questionId: question.id,
     questionBody: question.body,
+    direction: question.direction,
+    targetRole: question.askerRole,
     body,
     role: persisted.role,
     anonymous,
@@ -3360,6 +3547,9 @@ async function submitAnswer(form) {
         authorRole: persisted.role,
         body,
         anonymous,
+        questionBody: question.body,
+        direction: question.direction,
+        targetRole: question.askerRole,
       });
     } catch (error) {
       console.error("Unable to submit answer.", error);
@@ -3473,6 +3663,7 @@ function openNote(noteId, { fromHistory = false } = {}) {
   const notes = getAvailableNotes();
   const note = findViewableNote(noteId);
   if (!note) return;
+  if (dialog.dataset) delete dialog.dataset.submissionPreview;
   const isPhoto = note.kind === "photo" && Boolean(note.mediaUrl);
   const group = isPhoto ? [note] : notes.filter((item) => item.questionId === note.questionId);
   const otherAnswers = group.filter((item) => item.id !== note.id);
@@ -3563,12 +3754,14 @@ function renderPhotoNoteDetail(note, direction) {
 }
 
 function closeNoteDialog() {
+  const publicNoteOpen = Boolean(dialog.dataset?.noteId);
   if (dialog.dataset) delete dialog.dataset.noteId;
-  if (getNavigationSnapshot()?.overlayNoteId && navigationDepth > 0) {
+  if (dialog.dataset) delete dialog.dataset.submissionPreview;
+  if (publicNoteOpen && getNavigationSnapshot()?.overlayNoteId && navigationDepth > 0) {
     window.history.back();
     return;
   }
-  if (getNavigationSnapshot()?.overlayNoteId) {
+  if (publicNoteOpen && getNavigationSnapshot()?.overlayNoteId) {
     try {
       const url = new URL(window.location.href);
       url.searchParams.delete("note");
