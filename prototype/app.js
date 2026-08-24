@@ -1929,7 +1929,7 @@ function renderRecommendationEnd() {
         ${
           canGoBack
             ? `<span class="single-note-gesture-hint">
-                <span class="single-note-gesture-icon" aria-hidden="true">↓</span>
+                <span class="single-note-gesture-icon single-note-gesture-icon-reversed" aria-hidden="true">↓</span>
                 上滑回看上一张
               </span>`
             : ""

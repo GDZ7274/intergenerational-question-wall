@@ -2580,6 +2580,11 @@ h1 {
   opacity: 0.72;
 }
 
+/* The replay hint is an upward page gesture; rotate the shared down-arrow glyph 180°. */
+.single-note-gesture-icon-reversed {
+  transform: rotate(180deg);
+}
+
 @media (max-width: 600px) {
   .landing-page,
   .recommendation-page {

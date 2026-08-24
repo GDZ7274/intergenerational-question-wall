@@ -360,6 +360,7 @@ test("the completed wall shows a replay prompt and keeps upward page-swipe histo
   const endHtml = vm.runInContext("renderRecommendationEnd()", sandbox);
   assert.match(endHtml, /assets\/ending-duck\.gif/);
   assert.match(endHtml, /哎鸭，被你看完啦/);
+  assert.match(endHtml, /single-note-gesture-icon-reversed/);
   assert.match(endHtml, /上滑回看上一张/);
   assert.doesNotMatch(endHtml, /recommendation-end-kicker/);
   assert.doesNotMatch(endHtml, /推荐/);

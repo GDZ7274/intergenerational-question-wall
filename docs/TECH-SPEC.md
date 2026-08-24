@@ -221,7 +221,7 @@ admin_moderate_photo_note
 - 完整 schema v4 才启用照片能力。生产必须顺序应用 `0001_experience.sql`、`0002_moderation.sql`、`0003_operational_controls.sql`、`0004_release_hardening.sql`、`0005_photo_notes.sql`、`0006_photo_media_service_boundary.sql`，并部署 `photo-note-media`；已是 schema v3 的项目必须继续执行 `0005` 和 `0006`。
 - Pages 将完整 v4 识别为 `schemaVersion = 4`、`hardeningVersion = 1`、`submissionsRequireReview = true`、`photoNotesEnabled = true`、`photoUploadMode = moderator_only`、`photoMediaServiceBoundaryVersion = 1`。只有此时才验证 `wall_notes` 的照片投影，以及 Edge Function 对 Pages origin 的 CORS；探针成功后照片后台和公开照片能力才可用。部署函数前必须设置 `PHOTO_NOTE_ALLOWED_ORIGINS`；生产 origin 只写协议与主机，不含仓库路径。
 - `supabase-release` 支持手动 preflight/deploy，也会响应唯一 `supabase-v*` 标签。标签路径固定为 deploy，仍先 dry run 并在发现会重放 `0001` 至 `0004` 时拒绝；所有生产写入都受 `supabase-production` Environment 审批。推荐先将功能提交推送到功能分支并打标签，后端成功后再合并或推送 `main` 发布 Pages。
-- 静态页面 CSP 限制脚本样式为同源，连接目标为同源和托管 Supabase；Lucide 使用项目内 vendor 文件。当前资源缓存版本为 styles v23、app v24、backend v5、admin v8；改动资源时须同步更新 HTML 查询参数。
+- 静态页面 CSP 限制脚本样式为同源，连接目标为同源和托管 Supabase；Lucide 使用项目内 vendor 文件。当前资源缓存版本为 styles v24、app v25、backend v5、admin v8；改动资源时须同步更新 HTML 查询参数。
 - Pages 工作流运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs`。Pages 回滚不会回滚数据库迁移、Storage 或 Edge Function。
 
 ## 11. 未来规划（未实现）
