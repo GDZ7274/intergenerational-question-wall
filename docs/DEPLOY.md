@@ -117,7 +117,7 @@ git push -u origin main
 
 工作流会运行 `app.js`、`backend.js`、`admin.js` 的语法检查和 `tests/*.test.mjs`，核对关键资源、v4 迁移与 Edge Function 媒体动作契约，再验证远端审核基线。审核基线为 schema v3 + `hardeningVersion: 1` + `submissionsRequireReview: true`，通过后可发布文字问答前台；在此模式下照片后台会根据缺少的照片摘要字段自动隐藏，且不执行照片投影或函数 CORS 探针。若远端为完整 schema v4，工作流会额外验证照片投影和函数 CORS 后才启用照片能力。随后复制 `prototype/` 到临时发布目录，并用仓库变量生成仅用于线上 artifact 的 `config.js`。仓库中的 `prototype/config.js` 会继续保留空配置，方便本地演示，也避免把项目地址硬编码进源码。缺少变量、URL 不是托管 Supabase HTTPS 地址、审核基线不兼容，或完整 v4 的照片探针失败时，工作流会主动失败。Pages 回滚不会回滚数据库、Storage 或 Edge Function。
 
-当前公开页缓存版本为 `styles.css?v=25`、`app.js?v=26`、`backend.js?v=6`、`config.js?v=4`，后台为 `admin.css?v=6`、`admin.js?v=8`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 必须允许连接 Supabase API/Edge Function，并允许从受信 Supabase Storage 主机加载已发布照片；公开分享与后台采集的本地预览还需要 `blob:` 图片源。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
+当前公开页缓存版本为 `styles.css?v=25`、`app.js?v=27`、`backend.js?v=6`、`config.js?v=4`，后台为 `admin.css?v=6`、`admin.js?v=8`。Lucide 1.8.0 从 `prototype/vendor/lucide.min.js` 自托管。公开页和后台的 CSP 必须允许连接 Supabase API/Edge Function，并允许从受信 Supabase Storage 主机加载已发布照片；公开分享与后台采集的本地预览还需要 `blob:` 图片源。更新这些文件时应同步递增对应查询参数，避免手机端继续命中旧缓存。
 
 以后每次向 `main` 推送都会自动更新网站。由于浏览器和 CDN 可能缓存静态资源，发布后应在手机上重新打开页面或执行一次强制刷新。
 
